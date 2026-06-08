@@ -2,7 +2,7 @@
 import asyncio
 from celery import Task
 from workers.celery_app import celery_app
-from workers.models import TaskData
+from workers.models import TaskData, TaskCredentials
 from workers.tasks.fiction_processor import FictionProcessor
 from workers.tasks.academic_processor import AcademicProcessor
 from workers.enums import DataCategory
@@ -71,10 +71,12 @@ async def _process_documents_async(task: Task, task_data: TaskData):
         try:
             logger.info(f"Processing document: {doc.id}")
             
+            creds = TaskCredentials(**task_data.credentials) if task_data.credentials else None
             result = await processor.process_document(
                 task_id=task_data.task_id,
                 document=doc,
-                project_id=task_data.project_id
+                project_id=task_data.project_id,
+                credentials=creds,
             )
             
             results.append({

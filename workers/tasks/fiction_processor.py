@@ -1,5 +1,5 @@
 
-from workers.models import TaskDocument
+from workers.models import TaskDocument, TaskCredentials
 from workers.services.file_fetcher import FileFetcherService
 from workers.services.text_extractor import TextExtractorService
 from workers.services.chunking_service_fiction import ChunkingService
@@ -11,31 +11,41 @@ from workers.services.extracted_storage_service import ExtractedContentStorageSe
 from workers.utils.temp_file_manager import TempFileManager
 from workers.utils.webhook_notifier import WebhookNotifier
 from workers.enums import ProcessingStage
+from typing import Optional
 import logging
 
 logger = logging.getLogger(__name__)
 
 
 class FictionProcessor:
-    
+
     def __init__(self):
         self.file_fetcher = FileFetcherService()
         self.text_extractor = TextExtractorService()
         self.chunking_service = ChunkingService()
-        self.contextualizer = Contextualizer()
-        self.embedding_service = EmbeddingService()
         self.bm25_service = BM25Service()
         self.storage_service = StorageService()
         self.extracted_storage = ExtractedContentStorageService()
         self.temp_file_manager = TempFileManager()
         self.webhook_notifier = WebhookNotifier()
-    
+
     async def process_document(
         self,
         task_id: str,
         document: TaskDocument,
-        project_id: str
+        project_id: str,
+        credentials: Optional[TaskCredentials] = None,
     ) -> dict:
+        self.contextualizer = Contextualizer(
+            api_key=credentials.llm_api_key if credentials else None,
+            model=credentials.llm_model if credentials else None,
+            base_url=credentials.llm_base_url if credentials else None,
+        )
+        self.embedding_service = EmbeddingService(
+            api_key=credentials.embed_api_key if credentials else None,
+            model=credentials.embed_model if credentials else None,
+            base_url=credentials.embed_base_url if credentials else None,
+        )
 
         document_id = document.id
         current_stage = ProcessingStage.FETCHING_FILES
