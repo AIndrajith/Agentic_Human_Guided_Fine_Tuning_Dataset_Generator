@@ -4,17 +4,32 @@ from datetime import datetime
 
 
 class TaskDocument(BaseModel):
-    """Document information from task payload"""
     id: str
     file_size: int
 
 
+class TaskCredentials(BaseModel):
+    """Decrypted provider credentials forwarded from web_api at dispatch time."""
+    llm_provider:  Optional[str] = None
+    llm_api_key:   Optional[str] = None
+    llm_model:     Optional[str] = None
+    llm_base_url:  Optional[str] = None
+
+    embed_provider: Optional[str] = None
+    embed_api_key:  Optional[str] = None
+    embed_model:    Optional[str] = None
+    embed_base_url: Optional[str] = None
+
+    vision_api_key: Optional[str] = None
+    vision_model:   Optional[str] = None
+
+
 class TaskData(BaseModel):
-    """Task payload structure from Redis queue"""
-    task_id: str
-    project_id: str
-    documents: List[TaskDocument]
-    data_type: str  # "fiction" or "academic"
+    task_id:     str
+    project_id:  str
+    documents:   List[TaskDocument]
+    data_type:   str
+    credentials: Optional[TaskCredentials] = None
 
 
 class FileMetadata(BaseModel):

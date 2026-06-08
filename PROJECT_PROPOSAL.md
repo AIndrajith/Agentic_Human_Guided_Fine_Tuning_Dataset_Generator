@@ -83,10 +83,12 @@ The result is a clean, exportable fine-tuning dataset in standard formats (Chat,
          │
          ▼
 ┌────────────────────────────────────────────────────────────────┐
-│                 External APIs                                   │
-│   OpenAI (gpt-4o-mini, text-embedding-3-large)                 │
-│   Google Gemini (vision, Marker LLM backend)                   │
-│   Reranker (FlashRank local / Cohere API)                      │
+│           External APIs (configurable per project)             │
+│   LLM:        OpenAI · Anthropic · Google · Groq · Mistral     │
+│               Cohere · Together · OpenRouter · Azure · Ollama  │
+│   Embeddings: OpenAI · Google · Cohere · VoyageAI · Jina       │
+│               Ollama                                           │
+│   Reranker:   Cohere · Jina · Ollama                           │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -98,6 +100,18 @@ The result is a clean, exportable fine-tuning dataset in standard formats (Chat,
 | Phase 2: QA Generation | Generate, retrieve, validate, review, export | LangGraph (agentic, async LLM calls) |
 
 The same Redis instance serves as both the Celery broker and the LangGraph checkpoint store.
+
+### 2.3 Provider & Credential System
+
+Every LLM call in the platform — contextualization, embedding, question generation, answer generation, validation, reranking — routes through a single factory (`get_llm_client`) that resolves the right provider and model at runtime. There are no hardcoded API keys anywhere in the code.
+
+**Credential store:** An admin sets API keys through the platform's Credentials configuration page. Keys are encrypted at rest using Fernet symmetric encryption (AES-128) before being stored in MongoDB. The only secret that lives in the environment is the `ENCRYPTION_KEY` used for encryption/decryption. Keys are never returned by any API response — only a status of which fields are present is exposed.
+
+**Per-project model config:** Project owners configure which provider and model to use for each pipeline stage. The six configurable stages are: `question_generator`, `answer_generator`, `validator`, `meta_agent`, `embedder`, and `reranker`. The capability map enforces valid combinations — for example, Anthropic cannot serve the embedder stage since it has no embedding API.
+
+**Validation:** Before saving a config, the platform pings each stage's provider with a minimal request to catch bad model names or missing credentials immediately, not halfway through a job.
+
+**Workers:** When a Celery task is dispatched, the web API fetches and decrypts the relevant credentials and passes them in the task payload. Workers use the passed credentials, falling back to environment variables if none are provided (backwards-compatible).
 
 ---
 
@@ -344,7 +358,7 @@ No re-processing of PDFs. Content is read directly from `ExtractedFictionModel` 
 
 ### 4.4 The Three Agents
 
-Each agent has a dedicated system prompt configured per project before any job runs.
+Each agent has a dedicated system prompt configured per project before any job runs. Each agent also uses the provider and model configured for its stage in the project's model config (see §2.3) — the same question generation prompt can run against GPT-4o, Claude 3.5 Sonnet, or a local Ollama model without any code change.
 
 #### Question Generator
 - **Input**: 60k QA chunk + `question_generator_prompt` + job config
@@ -497,6 +511,7 @@ Application Level:
 ├── Admin
 │     Full system access. Manage all users, all projects,
 │     view system stats, manage infrastructure config.
+│     Set and rotate API credentials for all LLM/embedding/reranking providers.
 │
 └── User  (base role for all registered accounts)
       Can create projects, upload documents, manage their own content.
@@ -592,6 +607,30 @@ created_at:            datetime
 ```
 
 ### 7.2 New Models (Phase 2)
+
+#### `ProviderCredentialModel` — collection: `provider_credentials`
+```
+provider:          ModelProvider    openai | anthropic | google | groq | mistral |
+                                    cohere | together | openrouter | azure_openai |
+                                    voyageai | jina | ollama
+encrypted_fields:  dict[str, str]   field_name → Fernet-encrypted value
+                                    (e.g. api_key, endpoint, api_version)
+updated_at:        datetime
+```
+> Keys are write-only from the API. Only field names are returned in status responses, never values.
+
+#### `ProjectModelConfigModel` — collection: `project_model_configs`
+```
+project_id:        ObjectId
+stages:            dict[ModelStage, StageModelConfig]
+                     StageModelConfig: { provider, model_name, base_url? }
+                     Stages: question_generator | answer_generator | validator |
+                             meta_agent | embedder | reranker
+embedding_locked:  bool     True once first document is processed — prevents
+                            provider/model change that would corrupt Qdrant vectors
+created_at:        datetime
+updated_at:        datetime
+```
 
 #### `UserModel` — collection: `users`
 ```
@@ -842,7 +881,27 @@ POST   /dataset/{project_id}/export        Body: { format: CHAT | DPO | COT }
                                            Returns: JSONL file download
 ```
 
-### 8.9 Internal (worker-facing, existing)
+### 8.9 Credentials (admin only)
+```
+GET    /credentials/schema              Field definitions per provider (drives UI forms)
+GET    /credentials/                    Status of all providers — configured true/false,
+                                        field names present, updated_at. No key values.
+POST   /credentials/{provider}          Set/update credentials
+                                        Body: { fields: { api_key: "...", ... } }
+DELETE /credentials/{provider}          Remove credentials
+```
+
+### 8.10 Model Configuration
+```
+POST   /model-config/{project_id}       Set provider + model for each stage
+                                        Body: { stages: { question_generator: { provider, model_name },
+                                                          embedder: { provider, model_name }, ... } }
+GET    /model-config/{project_id}       Get current config
+POST   /model-config/{project_id}/validate  Ping all configured stages live and return
+                                            per-stage pass/fail results
+```
+
+### 8.11 Internal (worker-facing, existing)
 ```
 GET    /internal/files/{id}/metadata
 GET    /internal/files/{id}/base64
@@ -852,7 +911,7 @@ POST   /internal/extracted/academic/images/{document_id}
 POST   /internal/extracted/academic
 ```
 
-### 8.10 Webhooks (existing)
+### 8.12 Webhooks (existing)
 ```
 POST   /webhooks/processing-complete       Called by Celery workers on completion
 ```
@@ -877,10 +936,11 @@ POST   /webhooks/processing-complete       Called by Celery workers on completio
 | PDF text extraction | PyMuPDF | Fiction documents |
 | PDF → Markdown | Marker CLI | Academic documents |
 | Chunking | Chonkie | Both pipelines + QA chunks |
-| LLM | OpenAI gpt-4o-mini | Contextualization, question gen, answer gen, validation |
-| Embeddings | OpenAI text-embedding-3-large | 1536-dim dense vectors |
+| LLM | OpenAI · Anthropic · Google · Groq · Mistral · Cohere · Together · OpenRouter · Azure OpenAI · Ollama | All LLM stages, configurable per project |
+| Embeddings | OpenAI · Google · Cohere · VoyageAI · Jina · Ollama | Dense vector generation, configurable per project |
 | Vision / Marker LLM | Google Gemini | Image captioning, Marker backend |
-| Reranker | FlashRank (local) / Cohere API | Retrieved chunk reranking |
+| Reranker | Cohere · Jina · Ollama | Retrieved chunk reranking, configurable per project |
+| Credential encryption | cryptography (Fernet / AES-128) | Encrypt provider API keys at rest |
 | Authentication | python-jose + passlib | JWT tokens, password hashing |
 | HTTP client | httpx | Async HTTP calls |
 | Validation | Pydantic v2 | Request/response schemas |
@@ -908,17 +968,21 @@ d:\Synthetic_Data_Genration\
 │   ├── data_models\
 │   │   ├── BasicBeanieModels.py          DocumentModel, ProjectModel, ChunkModel
 │   │   ├── ExtractedModels.py            ExtractedFictionModel, ExtractedAcademicModel
+│   │   ├── CredentialModels.py           ProviderCredentialModel, schemas
+│   │   ├── ModelConfigModels.py          ProjectModelConfigModel, StageModelConfig
 │   │   ├── UserModels.py                 UserModel, ProjectMemberModel        [NEW]
 │   │   ├── SkillModels.py                SkillConfigModel                     [NEW]
 │   │   ├── QAModels.py                   QAJobModel, QAChunkModel, QAPairModel [NEW]
 │   │   ├── DataModels.py                 Pydantic request/response schemas
-│   │   └── enums.py                      All enums
+│   │   └── enums.py                      All enums (incl. ModelProvider, ModelStage)
 │   ├── routers\
 │   │   ├── FileMangerRouter.py
 │   │   ├── ProjectMangerRouter.py
 │   │   ├── ProcessingRouter.py
 │   │   ├── WebhookRouter.py
 │   │   ├── InternalRouter.py
+│   │   ├── CredentialRouter.py           /credentials endpoints
+│   │   ├── ModelConfigRouter.py          /model-config endpoints
 │   │   ├── AuthRouter.py                                                      [NEW]
 │   │   ├── SkillRouter.py                                                     [NEW]
 │   │   ├── QAJobRouter.py                                                     [NEW]
@@ -927,6 +991,10 @@ d:\Synthetic_Data_Genration\
 │   ├── services\
 │   │   ├── FileHandlerService.py
 │   │   ├── ProjectHandlerService.py
+│   │   ├── encryption_service.py         Fernet encrypt/decrypt
+│   │   ├── credential_service.py         CRUD for provider credentials
+│   │   ├── llm_factory.py                get_llm_client, call_chat, call_embed, call_rerank
+│   │   ├── ModelConfigService.py         per-project stage config + validation
 │   │   ├── AuthService.py                                                     [NEW]
 │   │   ├── SkillService.py               meta-agent prompt drafting           [NEW]
 │   │   └── DatasetExportService.py       CHAT / DPO / COT export             [NEW]
@@ -1022,7 +1090,7 @@ The following design choices are not yet finalized:
 
 | Decision | Options | Recommendation |
 |---|---|---|
-| **Reranker** | FlashRank (local, free) vs Cohere Rerank API (paid, higher quality) | FlashRank to avoid another paid dependency; upgrade later if quality insufficient |
+| **Reranker** | Cohere, Jina, or Ollama — selected per project via model config | Default to Cohere if available; Ollama for local/offline setups |
 | **DPO pair source** | (A) Deliberately generate 2 answers per question, or (B) use retry audit trail (original = rejected, final = chosen) | Option B — free, no extra LLM calls, natural quality gap |
 | **Retry cap** | Max retries before force-rejecting a QA pair | 3 retries |
 | **Academic QA source** | `markdown_text` vs `enriched_markdown` for QA chunks | `enriched_markdown` — image descriptions provide richer context for question generation |
@@ -1030,4 +1098,4 @@ The following design choices are not yet finalized:
 
 ---
 
-*Document version: 1.0 — reflects design discussions as of 2026-06-06*
+*Document version: 1.1 — updated 2026-06-07: added provider & credential system (§2.3, §8.9–8.10)*

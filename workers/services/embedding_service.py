@@ -11,13 +11,17 @@ logger = logging.getLogger(__name__)
 
 
 class EmbeddingService:
-    
-    def __init__(self):
-        self.client = AsyncOpenAI(api_key=Config.OPENAI_API_KEY)
-        self.model = Config.EMBEDDING_MODEL
+
+    def __init__(self, api_key: str = None, model: str = None, base_url: str = None):
+        resolved_key = api_key or Config.OPENAI_API_KEY
+        self.client = AsyncOpenAI(
+            api_key=resolved_key,
+            **({"base_url": base_url} if base_url else {})
+        )
+        self.model = model or Config.EMBEDDING_MODEL
         self.dimension = Config.EMBEDDING_DIMENSION
         self.batch_size = Config.EMBEDDING_BATCH_SIZE
-        
+
         logger.info(f"Initialized embedding service with model {self.model}")
     
     async def generate_embeddings(self, texts: List[str]) -> List[List[float]]:

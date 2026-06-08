@@ -16,18 +16,22 @@ logger = logging.getLogger(__name__)
 
 
 class Contextualizer:
-    
-    def __init__(self):
-        self.client = AsyncOpenAI(api_key=Config.OPENAI_API_KEY)
-        self.model = Config.LLM_MODEL
+
+    def __init__(self, api_key: str = None, model: str = None, base_url: str = None):
+        resolved_key = api_key or Config.OPENAI_API_KEY
+        self.client = AsyncOpenAI(
+            api_key=resolved_key,
+            **({"base_url": base_url} if base_url else {})
+        )
+        self.model = model or Config.LLM_MODEL
         self.temperature = Config.LLM_TEMPERATURE
         self.max_concurrent = Config.LLM_MAX_CONCURRENT_CALLS
         self.max_context_tokens = Config.LLM_MAX_CONTEXT_TOKENS
         self.max_chunks_per_batch = Config.LLM_MAX_CHUNKS_PER_BATCH
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
-        
+
         self.semaphore = asyncio.Semaphore(self.max_concurrent)
-        
+
         logger.info(f"Initialized contextualizer with model {self.model}, max concurrent: {self.max_concurrent}")
     
     async def contextualize_hierarchical(

@@ -20,24 +20,24 @@ class ImageReference:
 
 class VisionService:
 
-    def __init__(self, provider: Optional[str] = None):
+    def __init__(self, provider: Optional[str] = None, api_key: str = None, model_name: str = None):
         self.provider = provider or Config.VISION_MODEL_PROVIDER
         self.context_window = Config.VISION_CONTEXT_WINDOW
         self.semaphore = asyncio.Semaphore(Config.LLM_MAX_CONCURRENT_CALLS)
-        
+
         if self.provider == "gemini":
             import google.generativeai as genai
-            genai.configure(api_key=Config.GEMINI_API_KEY)
-            self.model = genai.GenerativeModel(Config.VISION_MODEL_NAME)
+            resolved_key = api_key or Config.GEMINI_API_KEY
+            resolved_model = model_name or Config.VISION_MODEL_NAME
+            genai.configure(api_key=resolved_key)
+            self.model = genai.GenerativeModel(resolved_model)
         elif self.provider == "openai":
             import openai
-            self.client = openai.AsyncOpenAI(api_key=Config.OPENAI_API_KEY)
-        # elif self.provider == "ollama":
-        #     import ollama
-        #     self.ollama_client = ollama
+            resolved_key = api_key or Config.OPENAI_API_KEY
+            self.client = openai.AsyncOpenAI(api_key=resolved_key)
         else:
             raise ValueError(f"Unsupported vision provider: {self.provider}")
-        
+
         logger.info(f"VisionService initialized with provider: {self.provider}")
     
     async def caption_images_with_context(
