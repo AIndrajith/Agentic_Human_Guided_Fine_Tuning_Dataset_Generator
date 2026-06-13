@@ -7,20 +7,23 @@ from web_api.data_models.enums import AppRole, ProjectRole
 
 class UserModel(Document):
     email: EmailStr
-    Username: str
+    username: str
     hashed_password: str
+
     app_role: AppRole = AppRole.USER
     is_active: bool = True
     must_change_password: bool = False
+
     setup_token: str = None
     setup_token_expiry: datetime = None
+
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     class Settings:
         name = "users"
         indexes = [
             IndexModel([("email", ASCENDING)], unique=True),
-            IndexModel([("Username", ASCENDING)], unique=True)
+            IndexModel([("username", ASCENDING)], unique=True)
         ]
 
 
@@ -36,5 +39,17 @@ class ProjectMemberModel(Document):
         indexes = [
             # A user can hold only one role per project; also serves member lookups
             IndexModel([("project_id", ASCENDING), ("user_id", ASCENDING)], unique=True),
+            IndexModel([("user_id", ASCENDING)]),
+        ]
+
+
+class EmailVerificationModel(Document):
+    user_id: PydanticObjectId
+    resend_id: str
+    sended_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    class Settings:
+        name = "email_verifications"
+        indexes = [
+            IndexModel([("resend_id", ASCENDING)], unique=True),
             IndexModel([("user_id", ASCENDING)]),
         ]
