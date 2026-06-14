@@ -1,116 +1,72 @@
 ================================================================
- SYNTHETIC DATA GENERATION PLATFORM — LOCAL RUN COMMANDS
- (Windows / PowerShell, from project root: d:\Synthetic_Data_Genration)
- Each service started individually — no docker compose.
+ SYNTHETIC DATA GENERATION — LOCAL RUN COMMANDS
+ Monorepo: web_api/ and workers/ are SEPARATE uv projects.
+ Run BOTH services from this repo root (imports are rooted here).
 ================================================================
 
 ----------------------------------------------------------------
- 1. FIRST-TIME ONLY — create the containers
+ 0. ONE-TIME — install each service's deps
 ----------------------------------------------------------------
-(Each command pulls the image, creates a named container with a
- persistent volume, and starts it.)
+cd web_api ; uv sync ; cd ..
+cd workers ; uv sync ; cd ..
 
-# --- Redis (Celery broker + result backend) — port 6379
-docker run -d --name synthetic_data_redis -p 6379:6379 -v redis_data:/data redis:7-alpine redis-server --appendonly yes
+----------------------------------------------------------------
+ 1. START SHARED INFRASTRUCTURE (Docker)
+----------------------------------------------------------------
+docker compose up -d            # redis, qdrant, minio, flower
 
-# --- Qdrant (vector database) — ports 6333 HTTP / 6334 gRPC
-docker run -d --name synthetic_data_qdrant -p 6333:6333 -p 6334:6334 -v qdrant_data:/qdrant/storage -e QDRANT_ALLOW_RECOVERY_MODE=true qdrant/qdrant:latest
-
-# --- MinIO (PDF/object storage) — ports 9000 API / 9001 web console
-docker run -d --name synthetic_data_minio -p 9000:9000 -p 9001:9001 -v minio_data:/data -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin minio/minio:latest server /data --console-address ":9001"
-
-# --- MongoDB (main database) — port 27017
+# MongoDB runs separately (compose entry is commented out):
 docker run -d --name synthetic_data_mongo -p 27017:27017 -v mongo_data:/data/db mongo:7
 
-# --- Flower (Celery monitoring, OPTIONAL) — port 5555
-# host.docker.internal lets the container reach the Redis container
-# through the host's published port (works on Docker Desktop).
-docker run -d --name synthetic_data_flower -p 5555:5555 mher/flower:latest celery --broker=redis://host.docker.internal:6379/0 flower --port=5555
-
-# --- Install python dependencies (creates .venv)
-uv sync
-
-----------------------------------------------------------------
- 2. EVERY TIME AFTER THAT — just start the existing containers
-----------------------------------------------------------------
-docker start synthetic_data_redis
-docker start synthetic_data_qdrant
-docker start synthetic_data_minio
+# every time after:
+docker compose start
 docker start synthetic_data_mongo
-docker start synthetic_data_flower        # optional
-
-# or all at once:
-docker start synthetic_data_redis synthetic_data_qdrant synthetic_data_minio synthetic_data_mongo synthetic_data_flower
 
 ----------------------------------------------------------------
- 3. RUN THE APPLICATION (two separate terminals)
+ 2. RUN THE SERVICES (two terminals, BOTH from repo root)
 ----------------------------------------------------------------
-# Terminal 1 — FastAPI web API (http://localhost:8000):
-uv run uvicorn web_api.main:app --reload --port 8000
+# Terminal 1 — web_api  (http://localhost:8000)
+web_api\.venv\Scripts\activate
+uvicorn web_api.main:app --reload --port 8000
 
-# Terminal 2 — Celery worker (document processing):
-# --pool=solo is REQUIRED on Windows (default prefork pool doesn't work)
-uv run celery -A workers.celery_app worker --loglevel=info --pool=solo
+# Terminal 2 — workers  (--pool=solo REQUIRED on Windows)
+workers\.venv\Scripts\activate
+celery -A workers.celery_app worker --loglevel=info --pool=solo
 
-----------------------------------------------------------------
- 4. .ENV — REQUIRED VARIABLES
-----------------------------------------------------------------
-# Already present:
-#   MONGODB_URL      = "mongodb://localhost:27017"
-#   DATABASE_NAME    = "synthetic_data_db"
-#   MINIO_ENDPOINT   = localhost:9000
-#   MINIO_ACCESS_KEY = minioadmin
-#   MINIO_SECRET_KEY = minioadmin
-#   MINIO_BUCKET     = synthetic-data
-#   MINIO_SECURE     = false
-#
-# MISSING — add these:
-#   ENCRYPTION_KEY   -> encrypts provider API keys at rest. Generate:
-#                       uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-#   OPENAI_API_KEY   -> workers: contextualization + embeddings
-#   GEMINI_API_KEY   -> workers: Marker LLM mode + image captioning (academic PDFs)
-#
-# Optional (defaults are fine for local):
-#   CELERY_BROKER_URL     = redis://localhost:6379/0
-#   CELERY_RESULT_BACKEND = redis://localhost:6379/1
-#   QDRANT_URL            = http://localhost:6333
-#   WEB_API_URL           = http://localhost:8000
+# Per-service detail: web_api/README.md and workers/README.md
 
 ----------------------------------------------------------------
- 5. VERIFY EVERYTHING IS UP
+ 3. .ENV (shared, at repo root — both services read it)
 ----------------------------------------------------------------
-docker ps                                  # all 4-5 containers "Up"
-API root:          http://localhost:8000   -> {"message": "Synthetic Data Generation API"}
-Swagger docs:      http://localhost:8000/docs
-Qdrant dashboard:  http://localhost:6333/dashboard
-MinIO console:     http://localhost:9001   (minioadmin / minioadmin)
-Flower:            http://localhost:5555
-Redis ping:        docker exec synthetic_data_redis redis-cli ping                          -> PONG
-Mongo ping:        docker exec synthetic_data_mongo mongosh --eval "db.runCommand({ping:1})"
+MONGODB_URL, DATABASE_NAME, MINIO_*, ENCRYPTION_KEY,
+OPENAI_API_KEY, GEMINI_API_KEY, (opt) CELERY_*, QDRANT_URL, WEB_API_URL
+
+Generate ENCRYPTION_KEY:
+  web_api\.venv\Scripts\python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 
 ----------------------------------------------------------------
- 6. STOPPING / CLEANUP
+ 4. VERIFY
 ----------------------------------------------------------------
-# Stop app: Ctrl+C in the uvicorn and celery terminals
-
-# Stop containers (data is kept in the named volumes):
-docker stop synthetic_data_redis synthetic_data_qdrant synthetic_data_minio synthetic_data_mongo synthetic_data_flower
-
-# Delete containers (data still kept in volumes):
-docker rm -f synthetic_data_redis synthetic_data_qdrant synthetic_data_minio synthetic_data_mongo synthetic_data_flower
-
-# Wipe ALL data (after deleting containers):
-docker volume rm redis_data qdrant_data minio_data mongo_data
+docker ps
+API:    http://localhost:8000/docs
+Qdrant: http://localhost:6333/dashboard
+MinIO:  http://localhost:9001  (minioadmin / minioadmin)
+Flower: http://localhost:5555
 
 ----------------------------------------------------------------
- 7. COMMON ISSUES
+ 5. STOP / CLEANUP
 ----------------------------------------------------------------
-- Celery hangs/crashes on tasks               -> forgot --pool=solo (Windows)
-- "Connection refused" on 6379/6333/9000      -> container not started, or Docker Desktop off
-- DB operations fail in API                   -> synthetic_data_mongo not running
-- Academic PDF processing fails               -> GEMINI_API_KEY missing
-- Embedding/contextualization fails           -> OPENAI_API_KEY missing
-- Credentials endpoints return 500            -> ENCRYPTION_KEY missing
-- Flower shows no broker connection           -> Redis container not up, or host.docker.internal
-                                                 unavailable (non-Docker-Desktop setups)
-- First academic PDF run very slow            -> Marker downloads models on first use (one-time)
+# Ctrl+C the two service terminals
+docker compose stop                     # stop infra (keep data)
+docker stop synthetic_data_mongo
+docker compose down -v                  # WIPE infra volumes
+
+----------------------------------------------------------------
+ 6. COMMON ISSUES
+----------------------------------------------------------------
+- Celery hangs on tasks            -> forgot --pool=solo (Windows)
+- ModuleNotFoundError web_api/...  -> not run from repo root, or wrong venv active
+- `import torch` works in web_api  -> bad split; torch belongs ONLY to workers
+- Connection refused 6379/6333     -> infra container not started
+- Credentials endpoints 500        -> ENCRYPTION_KEY missing
+- First academic PDF very slow     -> Marker downloads models once

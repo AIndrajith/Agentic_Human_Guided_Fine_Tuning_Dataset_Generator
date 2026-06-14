@@ -1,0 +1,50 @@
+{
+  "folders": [
+    { "path": ".",       "name": "root" },
+    { "path": "web_api",  "name": "web_api" },
+    { "path": "workers",  "name": "workers" }
+  ],
+  "settings": {
+    "files.exclude": {
+      "**/__pycache__": true,
+      "**/*.pyc": true,
+      "web_api": true,
+      "workers": true
+    },
+    "python.analysis.diagnosticMode": "openFilesOnly",
+    "git.openRepositoryInParentFolders": "always"
+  },
+  "launch": {
+    "version": "0.2.0",
+    "configurations": [],
+    "compounds": [
+      {
+        "name": "Run all · web_api + workers",
+        "configurations": [
+          { "folder": "web_api", "name": "web_api · FastAPI" },
+          { "folder": "workers", "name": "workers · Celery" }
+        ],
+        "stopAll": true
+      }
+    ]
+  },
+  "tasks": {
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "infra: up",
+        "type": "shell",
+        "command": "docker compose up -d --wait",
+        "options": { "cwd": "${workspaceFolder:root}" },
+        "problemMatcher": []
+      },
+      {
+        "label": "infra: stop",
+        "type": "shell",
+        "command": "docker compose stop",
+        "options": { "cwd": "${workspaceFolder:root}" },
+        "problemMatcher": []
+      }
+    ]
+  }
+}
