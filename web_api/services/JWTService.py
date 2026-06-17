@@ -1,4 +1,4 @@
-from jose import JoseError, jwt
+from jose import JOSEError, jwt
 from datetime import datetime, timedelta, timezone
 import os
 
@@ -22,5 +22,5 @@ class JWTService:
         try:
             payload = jwt.decode(token, self.secret_key, algorithms=[self.algorithm])
             return payload
-        except JoseError as e:
+        except JOSEError as e:
             raise RuntimeError("Invalid token") from e

@@ -7,15 +7,15 @@ from web_api.data_models.enums import AppRole, ProjectRole
 
 class UserModel(Document):
     email: EmailStr
-    username: str
-    hashed_password: str
+    username: str | None = None          # set during /setup
+    hashed_password: str | None = None   # set during /setup
 
     app_role: AppRole = AppRole.USER
     is_active: bool = True
     must_change_password: bool = True
 
-    setup_token: str = None
-    setup_token_expiry: datetime = None
+    setup_token: str | None = None
+    setup_token_expiry: datetime | None = None
 
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -23,7 +23,13 @@ class UserModel(Document):
         name = "users"
         indexes = [
             IndexModel([("email", ASCENDING)], unique=True),
-            IndexModel([("username", ASCENDING)], unique=True)
+            # partial: only enforce uniqueness on real usernames, so multiple
+            # invited users (username=None) don't collide on the null value.
+            IndexModel(
+                [("username", ASCENDING)],
+                unique=True,
+                partialFilterExpression={"username": {"$type": "string"}},
+            ),
         ]
 
 
