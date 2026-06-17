@@ -10,6 +10,7 @@ wheels/
 .venv
 
 # Environment variables
-.env
 
 Uploaded_Files/
+config.bat
+node_modules

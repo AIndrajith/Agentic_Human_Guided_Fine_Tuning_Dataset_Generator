@@ -1,16 +1,21 @@
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, Request
 from fastapi.security import OAuth2PasswordBearer
 from web_api.errors import InvalidCredentials,AuthorizationError
 from web_api.services.JWTService import JWTService
-from web_api.services.AuthService import AuthPayload
+from web_api.services.AuthService import AuthPayload, AuthService
 from web_api.data_models.enums import AppRole
 
 
-_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/users/login")
 
 
 def _get_jwt_service(request: Request) -> JWTService:
     return request.app.state.jwt_service
+
+
+def get_auth_service(request: Request) -> AuthService:
+    """Accessor: hand routers the single AuthService built in lifespan."""
+    return request.app.state.auth_service
 
 
 def _get_current_user(

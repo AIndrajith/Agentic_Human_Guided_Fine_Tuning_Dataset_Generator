@@ -1,7 +1,7 @@
-import email
 from web_api.services.SecurityService import SecurityService
 from beanie import PydanticObjectId
 from web_api.data_models.UserModels import UserModel
+from web_api.errors import UserNotFound
 
 class UserService:
     def __init__(self,SecurityService: SecurityService):
@@ -26,19 +26,19 @@ class UserService:
     async def is_user_active(self, user_id: PydanticObjectId) -> bool:
         user = await UserModel.get(user_id)
         if not user:
-            raise Exception("User not found")
+            raise UserNotFound()
         return user.is_active
     
     async def is_must_change_password(self, user_id: PydanticObjectId) -> bool:
         user = await UserModel.get(user_id)
         if not user:
-            raise Exception("User not found")
+            raise UserNotFound()
         return user.must_change_password
     
     async def update_username(self, user_id: PydanticObjectId, new_username: str):
         user = await UserModel.get(user_id)
         if not user:
-            raise Exception("User not found")
+            raise UserNotFound()
         user.username = new_username
         try:
             await user.save()
@@ -48,7 +48,7 @@ class UserService:
     async def update_password(self, user_id: PydanticObjectId, hashed_password: str):
         user = await UserModel.get(user_id)
         if not user:
-            raise Exception("User not found")
+            raise UserNotFound()
         user.hashed_password = hashed_password
         try:
             await user.save()
@@ -58,7 +58,7 @@ class UserService:
     async def update_UserName_and_Password(self, user_id: PydanticObjectId, new_username: str, hashed_password: str):
         user = await UserModel.get(user_id)
         if not user:
-            raise Exception("User not found")
+            raise UserNotFound()
         user.username = new_username
         user.hashed_password = hashed_password
         try:
@@ -76,7 +76,7 @@ class UserService:
     async def change_must_change_password(self, user_id: PydanticObjectId, must_change: bool):
         user = await UserModel.get(user_id)
         if not user:
-            raise Exception("User not found")
+            raise UserNotFound()
         user.must_change_password = must_change
         try:
             await user.save()

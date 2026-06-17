@@ -3,12 +3,19 @@ from web_api.services.SecurityService import SecurityService
 from web_api.data_models.UserModels import UserModel
 from datetime import datetime, timedelta, timezone
 from pydantic import EmailStr
-from data_models.enums import AppRole,ProjectRole
+from web_api.data_models.enums import AppRole
 from web_api.services.EmailService import EmailService
-from pydantic import EmailStr 
+from pydantic import EmailStr
 from beanie import PydanticObjectId
 from pydantic import BaseModel
 from web_api.services.JWTService import JWTService
+from web_api.errors import (
+    UserAlreadyExists,
+    InvalidOrExpiredToken,
+    AccountNotActive,
+    InvalidCredentials,
+    ConflictError,
+)
 
 
 class AuthPayload(BaseModel):
@@ -29,7 +36,7 @@ class AuthService:
     async def add_user(self,email : EmailStr, app_role : AppRole ):
         user: UserModel|None = await self.user_service.find_email(email)
         if user:
-            raise Exception("User already exists")
+            raise UserAlreadyExists()
         setup_token = self.security_service.generate_secure_token()
         setup_token_expiry = datetime.now(timezone.utc) + timedelta(hours=24)
         new_user = await self.user_service.add_new_user(email, app_role, setup_token, setup_token_expiry)
@@ -40,16 +47,16 @@ class AuthService:
     async def authenticate_initial_token(self, token: str) -> UserModel | None:
         user = await self.user_service.find_user_by_token(token)
         if not user:
-            raise Exception("Invalid token")
+            raise InvalidOrExpiredToken("Invalid token")
         if user.setup_token_expiry < datetime.now(timezone.utc):
-            raise Exception("Token expired")
+            raise InvalidOrExpiredToken("Token expired")
         return user
     
     async def set_credentials_first_login(self, user_id: PydanticObjectId, user_name: str, new_password: str)-> PydanticObjectId:
         if not await self.user_service.is_user_active(user_id):
-            raise Exception("User is not active")
+            raise AccountNotActive()
         if not await self.user_service.is_must_change_password(user_id):
-            raise Exception("Password cannot be changed at this time")
+            raise ConflictError("Password cannot be changed at this time")
 
         self.security_service.validate_password(new_password)
         hashed_password = self.security_service.hash_password(new_password)
@@ -59,11 +66,11 @@ class AuthService:
     async def authenticate_user(self, email: EmailStr, password: str) -> str:
         user = await self.user_service.find_email(email)
         if not user:
-            raise Exception("Invalid email or password")
+            raise InvalidCredentials()
         if not user.is_active:
-            raise Exception("User is not active")
+            raise AccountNotActive()
         if not self.security_service.verify_password(password, user.hashed_password):
-            raise Exception("Invalid email or password")
+            raise InvalidCredentials()
         
         auth_payload = AuthPayload(
             email=user.email,
@@ -77,7 +84,8 @@ class AuthService:
     
 
 
-
+def get_auth_service(user_service: UserService, security_service: SecurityService, jwt_service: JWTService, email_service: EmailService) -> AuthService:
+    return AuthService(user_service, security_service, jwt_service, email_service)
 
         
 
