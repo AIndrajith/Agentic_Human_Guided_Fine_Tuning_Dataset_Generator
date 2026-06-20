@@ -10,6 +10,9 @@ wheels/
 .venv
 
 # Environment variables
-.env
 
 Uploaded_Files/
+
+notebooks/chonkie_experiments.ipynb
+config.bat
+node_modules
