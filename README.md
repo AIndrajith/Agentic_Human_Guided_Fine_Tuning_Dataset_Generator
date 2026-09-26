@@ -63,6 +63,7 @@ Then open http://localhost:8000/docs. For workers, the front-end, tests and trou
 
 ## Documentation
 
+- [docs/api.md](docs/api.md): API guide with every endpoint, request/response fields, and the processing flow
 - [docs/development.md](docs/development.md): setup, running, tests, migrations, troubleshooting
 - [docs/design.md](docs/design.md): full architecture, pipelines, data model, API design
 - [web_api/README.md](web_api/README.md) · [workers/README.md](workers/README.md): service details
