@@ -2,10 +2,22 @@ from chonkie import SentenceChunker, TableChunker, CodeChunker, MarkdownChef
 from typing import List, Tuple, Dict
 from workers.models import ContextChunk, ChildChunk
 from workers.config import Config
+from workers.services.chunk_assignment import assign_children_to_parents
+from workers.utils.tokenizer import chunk_tokenizer
+from dataclasses import dataclass
 import logging
 import re
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _MathChunk:
+    """A math block is never split: it becomes one child as-is."""
+    text: str
+    token_count: int
+    start_index: int = 0
+    end_index: int = 0
 
 
 class AcademicChunkingService:
@@ -20,7 +32,7 @@ class AcademicChunkingService:
         self.parent_overlap = parent_overlap or Config.ACADEMIC_PARENT_CHUNK_OVERLAP
         
         self.parent_chunker = SentenceChunker(
-            tokenizer=Config.CHONKIE_TOKENIZER,
+            tokenizer=chunk_tokenizer(),
             chunk_size=self.parent_chunk_size,
             chunk_overlap=self.parent_overlap,  
             min_sentences_per_chunk=Config.CHONKIE_MIN_SENTENCES
@@ -28,7 +40,7 @@ class AcademicChunkingService:
         
         self.child_chunk_size = child_chunk_size or Config.ACADEMIC_CHILD_CHUNK_SIZE
         
-        self.markdown_chef = MarkdownChef(tokenizer=Config.CHONKIE_TOKENIZER)
+        self.markdown_chef = MarkdownChef(tokenizer=chunk_tokenizer())
         
         logger.info(
             f"AcademicChunkingService initialized: "
@@ -43,7 +55,7 @@ class AcademicChunkingService:
 
         logger.info(f"Creating academic hierarchical chunks for {len(enriched_markdown):,} chars")
         
-        doc = self.markdown_chef.process(enriched_markdown)
+        doc = self.markdown_chef.parse(enriched_markdown)   # parse(text); process() expects a file path
         logger.info(
             f"MarkdownChef found: {len(doc.tables)} tables, "
             f"{len(doc.code)} code blocks"
@@ -112,7 +124,7 @@ class AcademicChunkingService:
         global_child_index = 0
 
         text_chunker = SentenceChunker(
-            tokenizer=Config.CHONKIE_TOKENIZER,
+            tokenizer=chunk_tokenizer(),
             chunk_size=self.child_chunk_size,
             chunk_overlap=0,  
             min_sentences_per_chunk=1
@@ -123,73 +135,54 @@ class AcademicChunkingService:
             chunk_size=Config.ACADEMIC_TABLE_CHUNK_MAX_ROWS
         )
 
-        for parent_id, parent in enumerate(parent_chunks):
-            segments = self._build_segments_for_range(
-                markdown,
-                parent.start_index,
-                parent.end_index,
-                doc,
-                math_blocks
-            )
-            
-            for segment in segments:
-                seg_type = segment["type"]
-                content = segment["content"]
-                
-                if not content or not content.strip():
-                    continue
-                
-                chunks = []
-                
-                if seg_type == "text":
-                    chunks = text_chunker.chunk(content)
-                    
-                elif seg_type == "table":
-                    chunks = table_chunker.chunk(content)
-                    
-                elif seg_type == "code":
-                    code_chunker = CodeChunker(
-                        language=segment.get("language", "python"),
-                        tokenizer=Config.CHONKIE_TOKENIZER,
-                        chunk_size=Config.ACADEMIC_CODE_CHUNK_SIZE,
-                        include_nodes=False
-                    )
-                    chunks = code_chunker.chunk(content)
-                    
-                elif seg_type == "block_math":
-                    from dataclasses import dataclass
-                    @dataclass
-                    class MathChunk:
-                        text: str
-                        token_count: int
-                        start_index: int = 0
-                        end_index: int = 0
-                    
-                    import tiktoken
-                    tokenizer = tiktoken.get_encoding(Config.CHONKIE_TOKENIZER)
-                    token_count = len(tokenizer.encode(content))
-                    
-                    chunks = [MathChunk(
-                        text=content,
-                        token_count=token_count,
-                        start_index=0,
-                        end_index=len(content)
-                    )]
-                
-                for chunk in chunks:
-                    child_chunk = ChildChunk(
-                        index=global_child_index,
-                        parent_context_id=parent_id,
-                        original_text=chunk.text,
-                        start_index=segment["start"] + chunk.start_index,
-                        end_index=segment["start"] + chunk.end_index,
-                        token_count=chunk.token_count
-                    )
-                    
-                    all_child_chunks.append(child_chunk)
-                    parent_chunks[parent_id].child_indices.append(global_child_index)
-                    global_child_index += 1
-        
+        # segment the WHOLE document once (tables/code/math/text), then give each child one parent:
+        # chunking per parent range cut every overlap zone twice
+        segments = self._build_segments_for_range(markdown, 0, len(markdown), doc, math_blocks)
+
+        for segment in segments:
+            seg_type = segment["type"]
+            content = segment["content"]
+
+            if not content or not content.strip():
+                continue
+
+            chunks = []
+
+            if seg_type == "text":
+                chunks = text_chunker.chunk(content)
+
+            elif seg_type == "table":
+                chunks = table_chunker.chunk(content)
+
+            elif seg_type == "code":
+                code_chunker = CodeChunker(
+                    language=segment.get("language", "python"),
+                    tokenizer=chunk_tokenizer(),
+                    chunk_size=Config.ACADEMIC_CODE_CHUNK_SIZE,
+                    include_nodes=False
+                )
+                chunks = code_chunker.chunk(content)
+
+            elif seg_type == "block_math":
+                chunks = [_MathChunk(
+                    text=content,
+                    token_count=len(chunk_tokenizer().encode(content)),
+                    start_index=0,
+                    end_index=len(content)
+                )]
+
+            for chunk in chunks:
+                all_child_chunks.append(ChildChunk(
+                    index=global_child_index,
+                    parent_context_id=-1,   # set by assign_children_to_parents
+                    original_text=chunk.text,
+                    start_index=segment["start"] + chunk.start_index,
+                    end_index=segment["start"] + chunk.end_index,
+                    token_count=chunk.token_count
+                ))
+                global_child_index += 1
+
+        assign_children_to_parents(parent_chunks, all_child_chunks)
         return all_child_chunks
     
     def _build_segments_for_range(

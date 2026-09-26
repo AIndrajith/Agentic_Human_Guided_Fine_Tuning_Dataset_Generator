@@ -7,7 +7,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from web_api.core.celery_client import PROCESS_DOCUMENTS_TASK, get_celery
-from web_api.data_models.enums import Datatype, DocumentStatus, FileType, JobStatus, ModelProvider, ModelStage
+from web_api.data_models.enums import Datatype, DocumentStatus, FileType, JobStatus, ModelStage
 from web_api.data_models.ProcessingModels import (
     ChunkCompletionData,
     JobDocumentResponse,
@@ -21,7 +21,7 @@ from web_api.errors import ConflictError, DocumentNotFound, JobNotFound, Project
 from web_api.services import llm_gateway
 from web_api.services.credential_service import CredentialService
 from web_api.services.ModelCatalogService import ModelCatalogService
-from web_api.services.providers import STAGE_CAPABILITY
+from web_api.services.providers import STAGE_CAPABILITY, ModelSource
 from web_api.services.QdrantService import collection_name
 
 logger = logging.getLogger(__name__)
@@ -65,14 +65,18 @@ class ProcessingService:
         capability = STAGE_CAPABILITY[stage_model.stage]
 
         info = llm_gateway.catalog_lookup(credential.provider, stage_model.model_name)
-        if credential.provider == ModelProvider.AZURE_OPENAI:   # deployment name -> look up its base model
+        context_window = info.context_window if info else None
+        if connection.spec.model_source == ModelSource.REGISTERED:
             registered = await ModelCatalogService(self.session).find_registered(credential.id, stage_model.model_name)
-            if registered and registered.base_model:
-                info = llm_gateway.catalog_lookup(credential.provider, registered.base_model)
+            if registered:
+                if registered.base_model:   # Azure deployment -> details of its real model
+                    info = llm_gateway.catalog_lookup(credential.provider, registered.base_model) or info
+                # Ollama: read from the server at sync; Azure: filled from the base model
+                context_window = registered.context_window or (info.context_window if info else None)
         return {
             "model": connection.model_id(stage_model.model_name, capability),
             **connection.litellm_kwargs(),
-            "context_window": info.context_window if info else None,
+            "context_window": context_window,
             "supports_json_schema": info.supports_json_schema if info else False,
         }
 

@@ -45,7 +45,8 @@ class Config:
     PARENT_CHUNK_SIZE = 30000  # tokens - context window for LLM
     PARENT_CHUNK_OVERLAP = 5000  # tokens - overlap between parent chunks
     CHILD_CHUNK_SIZE = 800  # tokens - retrieval chunks
-    CHILD_CHUNK_OVERLAP = 100  # tokens - overlap between child chunks
+    CHILD_CHUNK_OVERLAP = 0  # tokens - no child overlap: sentence boundaries + context notes cover the edges,
+                             # and overlap would create near-duplicate chunks (duplicate QA pairs later)
     CHONKIE_TOKENIZER = "o200k_harmony"  # tokenizer for Chonkie
     CHONKIE_MIN_SENTENCES = 1  # minimum sentences per chunk
     
@@ -79,11 +80,11 @@ class Config:
 
     # ========== Marker Configuration (Academic PDFs) ==========
     MARKER_OUTPUT_FORMAT = "markdown"
-    MARKER_USE_LLM = True
-    MARKER_FORCE_OCR = True
+    MARKER_USE_LLM = True           # uses the project's vision model (see pdf_to_markdown.marker_llm_settings)
+    MARKER_FORCE_OCR = False        # Marker 2 re-OCRs only bad pages/blocks; forcing it is very slow on CPU
     MARKER_REDO_INLINE_MATH = True
-    MARKER_LLM_SERVICE = "marker.services.gemini.GoogleGeminiService"
-    MARKER_TIMEOUT = 120  # seconds
+    MARKER_MODE = os.getenv("MARKER_MODE") or None   # "balanced" | "fast"; None = Marker picks by device
+    MARKER_TIMEOUT = int(os.getenv("MARKER_TIMEOUT", "1800"))  # seconds per PDF
     
     # ========== Vision Model Configuration (Image Captioning) ==========
     # the vision model comes from the project's processing config

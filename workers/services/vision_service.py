@@ -130,7 +130,7 @@ Be specific and include all visible text and numbers.
         async with self.semaphore:
             try:
                 mime = mimetypes.guess_type(image_path.name)[0] or "image/png"
-                img_b64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+                img_b64 = base64.b64encode(await asyncio.to_thread(image_path.read_bytes)).decode("utf-8")
                 response = await retry_async(
                     litellm.acompletion,
                     what=f"caption {filename}",

@@ -3,7 +3,7 @@ from workers.models import TaskDocument, ProcessingConfig
 from workers.services.file_fetcher import FileFetcherService
 from workers.services.text_extractor import TextExtractorService
 from workers.services.chunking_service_fiction import ChunkingService
-from workers.services.contextualizer import Contextualizer
+from workers.services.contextualizer import Contextualizer, plan_context_budget
 from workers.services.embedding_service import EmbeddingService
 from workers.services.bm25_service import BM25Service
 from workers.services.storage_service import StorageService
@@ -11,7 +11,7 @@ from workers.services.extracted_storage_service import ExtractedContentStorageSe
 from workers.utils.temp_file_manager import TempFileManager
 from workers.utils.webhook_notifier import WebhookNotifier
 from workers.enums import ProcessingStage
-from typing import Optional
+import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,6 @@ class FictionProcessor:
     def __init__(self):
         self.file_fetcher = FileFetcherService()
         self.text_extractor = TextExtractorService()
-        self.chunking_service = ChunkingService()
         self.bm25_service = BM25Service()
         self.extracted_storage = ExtractedContentStorageService()
         self.temp_file_manager = TempFileManager()
@@ -35,7 +34,6 @@ class FictionProcessor:
         project_id: str,
         config: ProcessingConfig,
     ) -> dict:
-        self.contextualizer = Contextualizer(config.llm)
         self.embedding_service = EmbeddingService(config.embedder)
         self.storage_service = StorageService(config.qdrant_collection, config.embedder.dimension)
 
@@ -61,7 +59,8 @@ class FictionProcessor:
             logger.info(f"[{document_id}] Stage: {ProcessingStage.EXTRACTING_TEXT.value}")
             current_stage = ProcessingStage.EXTRACTING_TEXT
 
-            extracted_text = self.text_extractor.extract_text_from_pdf(file_path)
+            # PyMuPDF is blocking: run it in a thread so the event loop stays free
+            extracted_text = await asyncio.to_thread(self.text_extractor.extract_text_from_pdf, file_path)
 
             if not extracted_text.strip():
                 raise ValueError("Extracted text is empty")
@@ -71,7 +70,7 @@ class FictionProcessor:
             current_stage = ProcessingStage.STORING_EXTRACTED_CONTENT
 
             extraction_metadata = {
-                "page_count": self.text_extractor.get_page_count(file_path),
+                "page_count": await asyncio.to_thread(self.text_extractor.get_page_count, file_path),
                 "extraction_method": "PyMuPDF",
                 "character_count": len(extracted_text),
                 "file_size": file_metadata.file_size
@@ -92,6 +91,13 @@ class FictionProcessor:
             # ===== 3. Hierarchical Chunking =====
             logger.info(f"[{document_id}] Stage: {ProcessingStage.CHUNKING.value}")
             current_stage = ProcessingStage.CHUNKING
+
+            # parent + batch size follow the meta_agent model's context window (whole parent goes in the prompt)
+            budget = plan_context_budget(config.llm.context_window)
+            self.chunking_service = ChunkingService(
+                parent_chunk_size=budget.parent_tokens, parent_overlap=budget.parent_overlap
+            )
+            self.contextualizer = Contextualizer(config.llm, budget)
 
             context_chunks, child_chunks = self.chunking_service.create_hierarchical_chunks(extracted_text)
             logger.info(f"[{document_id}] Created {len(context_chunks)} parent chunks, {len(child_chunks)} child chunks")

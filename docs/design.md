@@ -161,9 +161,9 @@ Qdrant → the project's collection (project_<id>)
 ```
 PDF Upload
     ↓
-Marker CLI (PDF → Markdown)
-    ├─ use_llm: true (Google Gemini backend)
-    ├─ force_ocr: true
+Marker 2 (PDF → Markdown), child process
+    ├─ use_llm: the project's vision model (Gemini / OpenAI / Claude / Azure / Ollama / OpenRouter)
+    ├─ selective OCR (only bad pages/blocks; force_ocr off)
     ├─ redo_inline_math: true
     └─ Extracts: markdown text + image files + metadata.json
     ↓
@@ -197,12 +197,16 @@ The chunking design is hierarchical with a clear separation of roles:
 
 | Level | Size | Overlap | Purpose |
 |---|---|---|---|
-| Parent chunk | 30,000 tokens | 5,000 tokens | Context window for LLM during contextualization and QA generation |
+| Parent chunk | up to 30,000 tokens (fits the meta_agent model) | 1/6 of its size, max 5,000 | Context window for LLM during contextualization and QA generation |
 | Child chunk | 800 tokens | 0 | Retrieval unit — what gets embedded and searched in Qdrant |
 
+- Children are cut **once over the whole document** (positions count from the document start). Each child belongs to exactly **one** parent: the one that contains it where it sits closest to the middle. Parent overlap only adds context; it never duplicates children.
+- Parent and batch size follow the meta_agent model's context window (with a 15% margin), so the whole parent always fits in one call. Ollama models are told the context size they need (`num_ctx`).
+
 Each child chunk goes through contextualization:
-- The parent chunk (30k window) is given to GPT-4o-mini
-- LLM generates a 50–200 token description of the broader context
+- The **whole** parent chunk goes first in the prompt (identical for every batch of that parent, so providers can cache it), then up to 30 children
+- The meta_agent model writes a 50–200 token description per child; a wrong number of descriptions is retried
+- If a batch still fails after its retries, the document fails — no chunk is stored without its note
 - `combined_text = context_description + original_child_text`
 - `combined_text` is what gets embedded — not the raw child text
 

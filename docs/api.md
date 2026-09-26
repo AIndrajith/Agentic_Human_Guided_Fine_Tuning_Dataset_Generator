@@ -656,7 +656,7 @@ Things that are true today and worth remembering:
 
 - **No token refresh.** Tokens expire after 20 minutes; log in again.
 - **Any member can delete documents** — not only owners. Change it in `FileMangerRouter.py` if you want owner-only.
-- **Worker bugs still open** from the audit: context-note gaps, chunk overlap duplicates, Marker timeout/key handling (Marker still reads `GEMINI_API_KEY` from `.env`), some blocking calls (PyMuPDF, Marker).
+- **Academic PDFs not yet tried end to end with Marker 2.** The first real run downloads Marker's models and starts its local inference server, so expect it to be slow once.
 - **Search** (not built yet): keyword search sends the query text to Qdrant with the same BM25 model and options as storage — use `BM25Service.query_document()` from `workers/services/bm25_service.py` (`query_points(query=..., using="sparse")`, client created with `cloud_inference=True`).
 - **Jina embedding models** aren't in LiteLLM's catalog yet — use "Other…" (type the name; it's tested on save).
 - **Images** can be uploaded but not processed yet.

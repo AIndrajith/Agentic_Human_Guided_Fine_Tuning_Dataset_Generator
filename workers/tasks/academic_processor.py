@@ -3,7 +3,7 @@ from workers.services.file_fetcher import FileFetcherService
 from workers.services.pdf_to_markdown import PDFToMarkdownService
 from workers.services.vision_service import VisionService
 from workers.services.chunking_service_academic import AcademicChunkingService
-from workers.services.contextualizer import Contextualizer
+from workers.services.contextualizer import Contextualizer, plan_context_budget
 from workers.services.embedding_service import EmbeddingService
 from workers.services.bm25_service import BM25Service
 from workers.services.storage_service import StorageService
@@ -12,7 +12,7 @@ from workers.utils.temp_file_manager import TempFileManager
 from workers.utils.webhook_notifier import WebhookNotifier
 from workers.enums import ProcessingStage
 from workers.config import Config
-from typing import Optional
+from workers.utils.tokenizer import chunk_tokenizer
 import logging
 import re
 from pathlib import Path
@@ -26,7 +26,6 @@ class AcademicProcessor:
     def __init__(self):
         self.file_fetcher = FileFetcherService()
         self.pdf_to_markdown = PDFToMarkdownService()
-        self.chunking_service = AcademicChunkingService()
         self.bm25_service = BM25Service()
         self.extracted_storage = ExtractedContentStorageService()
         self.temp_file_manager = TempFileManager()
@@ -42,7 +41,6 @@ class AcademicProcessor:
         if config.vision is None:
             raise ValueError("Academic processing needs a vision model step")
         self.vision_service = VisionService(config.vision)
-        self.contextualizer = Contextualizer(config.llm)
         self.embedding_service = EmbeddingService(config.embedder)
         self.storage_service = StorageService(config.qdrant_collection, config.embedder.dimension)
 
@@ -73,9 +71,11 @@ class AcademicProcessor:
                 f"{document_id}_marker_output"
             )
             
-            marker_output = self.pdf_to_markdown.convert_pdf(
+            # Marker's LLM step uses the project's vision model; runs as a child process (non-blocking)
+            marker_output = await self.pdf_to_markdown.convert_pdf(
                 pdf_path=pdf_path,
-                output_dir=marker_output_dir
+                output_dir=marker_output_dir,
+                vision=config.vision,
             )
             
             logger.info(
@@ -90,8 +90,8 @@ class AcademicProcessor:
                 current_stage = ProcessingStage.IMAGE_CAPTIONING
                 
                 # Parse markdown to get image references with positions
-                chef = MarkdownChef(tokenizer=Config.CHONKIE_TOKENIZER)
-                doc_parsed = chef.process(marker_output.markdown_text)
+                chef = MarkdownChef(tokenizer=chunk_tokenizer())
+                doc_parsed = chef.parse(marker_output.markdown_text)   # parse(text); process() expects a file path
                 
                 image_descriptions = await self.vision_service.caption_images_with_context(
                     markdown_content=marker_output.markdown_text,
@@ -167,7 +167,14 @@ class AcademicProcessor:
             # ===== 5. Smart Hierarchical Chunking =====
             logger.info(f"[{document_id}] Stage: {ProcessingStage.CHUNKING.value}")
             current_stage = ProcessingStage.CHUNKING
-            
+
+            # parent + batch size follow the meta_agent model's context window (whole parent goes in the prompt)
+            budget = plan_context_budget(config.llm.context_window, child_tokens=Config.ACADEMIC_CHILD_CHUNK_SIZE)
+            self.chunking_service = AcademicChunkingService(
+                parent_chunk_size=budget.parent_tokens, parent_overlap=budget.parent_overlap
+            )
+            self.contextualizer = Contextualizer(config.llm, budget)
+
             context_chunks, child_chunks = self.chunking_service.create_hierarchical_chunks(
                 enriched_markdown
             )
