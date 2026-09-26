@@ -56,8 +56,10 @@ On Windows, `--loop asyncio:SelectorEventLoop` (psycopg async can't use the Proa
 ## 3. Everyday tasks
 
 ```powershell
-# Tests (synthetic_data_test database; email, MinIO and Celery are faked)
+# Tests (synthetic_data_test database; email, MinIO, Celery, Qdrant and model calls are faked)
 uv run --project web_api pytest web_api/tests
+# Worker tests (no network: BM25, point ids, retry rules)
+uv run --project workers pytest workers/tests
 
 # After changing web_api/db/models: create a migration, REVIEW the file, then apply it
 cd web_api
@@ -81,7 +83,7 @@ All settings live in the repo-root `.env`, which both services read. `.env.examp
 - **Email:** if `RESEND_API_KEY` or `FROM_EMAIL` is unset, invite links are written to the API log instead of being emailed.
 - **LLM provider keys** are not environment variables. Admins add them in the app (Credentials); the worker fetches them per job from web_api. Only Marker (academic PDFs) still reads `GEMINI_API_KEY` from `.env`.
 - **LiteLLM** (both services) downloads its newest model catalog at startup. Set `LITELLM_LOCAL_MODEL_COST_MAP=True` to use the copy bundled with the package (offline; tests do this). The version is pinned in both `pyproject.toml` files; upgrade it on purpose.
-- **Qdrant:** one collection per project (`project_<id>`), created by the worker. `QDRANT_URL` is used by the worker and by web_api (to delete collections).
+- **Qdrant:** one collection per project (`project_<id>`), created by the worker. `QDRANT_URL` is used by the worker and by web_api (to delete collections). The image is pinned to `v1.18.0`: **1.15.2 or newer is required**, because Qdrant computes the BM25 keyword vectors itself. The worker refuses to create collections on an older server.
 
 ## 5. Troubleshooting
 
@@ -93,5 +95,6 @@ All settings live in the repo-root `.env`, which both services read. `.env.examp
 | API startup waits ~25 s | MinIO isn't running: `docker compose up -d` |
 | Celery hangs on tasks | Missing `--pool=solo` (Windows) |
 | `ModuleNotFoundError: web_api` | Run from the repo root |
+| Worker: `Qdrant 1.x is too old` | Update the image: `docker compose pull qdrant; docker compose up -d qdrant`. If the old data won't load, remove the `qdrant_data` volume (dev only; the vectors get rebuilt by reprocessing) |
 | Worker calls get 401 | `INTERNAL_API_TOKEN` differs between the API and the worker environment |
 | First academic PDF is very slow | Marker downloads its models once, then caches them |

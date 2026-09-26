@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import litellm
 from workers.config import Config
 from workers.models import ModelEndpoint
+from workers.utils.retry import retry_async
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +131,9 @@ Be specific and include all visible text and numbers.
             try:
                 mime = mimetypes.guess_type(image_path.name)[0] or "image/png"
                 img_b64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
-                response = await litellm.acompletion(
+                response = await retry_async(
+                    litellm.acompletion,
+                    what=f"caption {filename}",
                     model=self.vision.model,
                     messages=[{
                         "role": "user",

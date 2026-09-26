@@ -124,8 +124,8 @@ class FictionProcessor:
             logger.info(f"[{document_id}] Stage: {ProcessingStage.GENERATING_BM25.value}")
             current_stage = ProcessingStage.GENERATING_BM25
 
-            # Use combined text for BM25 (includes context + original)
-            sparse_vectors = self.bm25_service.generate_sparse_vectors_batch(combined_texts)
+            # BM25 over the combined text (context + original); Qdrant computes the vectors on upsert
+            sparse_vectors = self.bm25_service.documents(combined_texts)
 
             # ===== 7. Store in Qdrant =====
             logger.info(f"[{document_id}] Stage: {ProcessingStage.STORING_VECTORS.value}")

@@ -205,7 +205,8 @@ class AcademicProcessor:
             logger.info(f"[{document_id}] Stage: {ProcessingStage.GENERATING_BM25.value}")
             current_stage = ProcessingStage.GENERATING_BM25
             
-            sparse_vectors = self.bm25_service.generate_sparse_vectors_batch(combined_texts)
+            # BM25: Qdrant computes the vectors from the text on upsert
+            sparse_vectors = self.bm25_service.documents(combined_texts)
 
             # ===== 9. Store in Qdrant =====
             logger.info(f"[{document_id}] Stage: {ProcessingStage.STORING_VECTORS.value}")

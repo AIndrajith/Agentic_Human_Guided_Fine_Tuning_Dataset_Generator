@@ -35,5 +35,21 @@ Loaded automatically from the repo-root `.env`.
 Models and provider keys are **not** in `.env`: once per task the worker fetches them from
 `GET /internal/projects/{id}/processing-config` and calls every provider through LiteLLM.
 
+## Reliability
+- **Each document succeeds or fails on its own** and reports it to web_api; a failed document never
+  makes the others run again.
+- **Only temporary errors are retried** (network, rate limits, 5xx), at the step that hit them, 3 tries
+  with 2 s / 4 s waits (`workers/utils/retry.py`). A wrong key, unknown model or broken PDF fails at once.
+- **Reprocessing is safe:** Qdrant point ids come from `document_id + chunk number`, and a document's old
+  points are deleted before its new ones are stored.
+- **Keyword search (BM25)** is computed by Qdrant itself (built-in `qdrant/bm25`, needs Qdrant 1.15.2+):
+  the worker sends the chunk text, Qdrant does tokenizing, stopwords, stemming and stable word ids.
+  Search sends the query text the same way: `BM25Service.query_document()`.
+
+## Tests
+```
+uv run --project workers pytest workers/tests      # from the repo root
+```
+
 ## Notes
 - First academic PDF run is slow — Marker downloads models once, then caches.

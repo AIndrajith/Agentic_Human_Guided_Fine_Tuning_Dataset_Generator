@@ -6,6 +6,7 @@ from typing import List
 import litellm
 from workers.config import Config
 from workers.models import EmbedderEndpoint
+from workers.utils.retry import retry_async
 import logging
 
 logger = logging.getLogger(__name__)
@@ -26,7 +27,9 @@ class EmbeddingService:
         logger.info(f"Initialized embedding service with model {self.model} ({self.dimension}d)")
 
     async def _embed(self, texts: List[str]) -> List[List[float]]:
-        response = await litellm.aembedding(model=self.model, input=texts, **self.embedder.call_kwargs())
+        response = await retry_async(
+            litellm.aembedding, model=self.model, input=texts, what="embedding batch", **self.embedder.call_kwargs()
+        )
         # keep input order even if the provider returns items out of order
         items = sorted(response.data, key=lambda i: i["index"] if isinstance(i, dict) else i.index)
         vectors = [_vector(item) for item in items]

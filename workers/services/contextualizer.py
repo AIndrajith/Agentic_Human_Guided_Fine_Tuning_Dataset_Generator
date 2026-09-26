@@ -9,6 +9,7 @@ from workers.models import (
  ContextualOutput,ContextChunk, ChildChunk, ContextualizedChildChunk, ModelEndpoint
 )
 from workers.config import Config
+from workers.utils.retry import is_permanent_api_error
 import tiktoken
 import logging
 
@@ -147,6 +148,9 @@ class Contextualizer:
                 logger.warning(
                     f"Contextualization attempt {attempt + 1}/{max_retries} failed: {str(e)}"
                 )
+                # a bad key / unknown model won't fix itself; bad JSON or a network hiccup might
+                if is_permanent_api_error(e):
+                    raise
                 if attempt < max_retries - 1:
                     wait_time = 2 ** attempt  # Exponential backoff
                     await asyncio.sleep(wait_time)

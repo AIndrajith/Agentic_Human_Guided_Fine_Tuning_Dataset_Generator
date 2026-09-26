@@ -656,7 +656,8 @@ Things that are true today and worth remembering:
 
 - **No token refresh.** Tokens expire after 20 minutes; log in again.
 - **Any member can delete documents** — not only owners. Change it in `FileMangerRouter.py` if you want owner-only.
-- **Worker bugs still open** from the audit: BM25 hashing, random point IDs (duplicates on retry), whole-task retries, context-note gaps, chunk overlap duplicates, Marker timeout/key handling (Marker still reads `GEMINI_API_KEY` from `.env`), blocking calls.
+- **Worker bugs still open** from the audit: context-note gaps, chunk overlap duplicates, Marker timeout/key handling (Marker still reads `GEMINI_API_KEY` from `.env`), some blocking calls (PyMuPDF, Marker).
+- **Search** (not built yet): keyword search sends the query text to Qdrant with the same BM25 model and options as storage — use `BM25Service.query_document()` from `workers/services/bm25_service.py` (`query_points(query=..., using="sparse")`, client created with `cloud_inference=True`).
 - **Jina embedding models** aren't in LiteLLM's catalog yet — use "Other…" (type the name; it's tested on save).
 - **Images** can be uploaded but not processed yet.
 - **QA generation, review and export** endpoints (in [design.md](design.md) §8.5–8.8) don't exist yet.

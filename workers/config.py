@@ -66,7 +66,14 @@ class Config:
     # model + vector size come from the project's processing config
     EMBEDDING_BATCH_SIZE = 100  # Batch size for embedding API calls
 
+    # ========== BM25 (keyword search, computed by Qdrant 1.15.2+) ==========
+    BM25_K = 1.2          # how fast repeated words stop adding weight
+    BM25_B = 0.75         # how much long chunks are penalised
+    BM25_AVG_LEN = 400.0  # typical words per chunk after stopword removal (800-token chunk + context note)
+    BM25_LANGUAGE = "english"  # stemming + stopwords
+
     # ========== Qdrant Configuration ==========
+    QDRANT_UPSERT_BATCH_SIZE = 256  # points per upsert request (keeps requests under Qdrant's size limit)
     # one collection per project; its name comes from the processing config
     QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 
