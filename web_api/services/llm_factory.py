@@ -47,6 +47,9 @@ STAGE_CAPABILITIES: dict[ModelStage, set[ModelProvider]] = {
     ModelStage.RERANKER: {
         ModelProvider.COHERE, ModelProvider.JINA, ModelProvider.OLLAMA,
     },
+    ModelStage.VISION: {
+        ModelProvider.GOOGLE, ModelProvider.OPENAI,
+    },
 }
 
 _OPENAI_COMPAT_BASE_URLS = {

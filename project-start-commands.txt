@@ -13,21 +13,23 @@ cd workers ; uv sync ; cd ..
 ----------------------------------------------------------------
  1. START SHARED INFRASTRUCTURE (Docker)
 ----------------------------------------------------------------
-docker compose up -d            # redis, qdrant, minio, flower
+docker compose up -d            # postgres, redis, qdrant, minio, flower
+# postgres roles (synth_owner / synth_app) are created on FIRST start only,
+# from infra/postgres/init/01-roles.sh using the passwords in .env
 
-# MongoDB runs separately (compose entry is commented out):
+# (legacy, until the Mongo -> Postgres migration is finished)
 docker run -d --name synthetic_data_mongo -p 27017:27017 -v mongo_data:/data/db mongo:7
 
 # every time after:
 docker compose start
-docker start synthetic_data_mongo
 
 ----------------------------------------------------------------
  2. RUN THE SERVICES (two terminals, BOTH from repo root)
 ----------------------------------------------------------------
 # Terminal 1 — web_api  (http://localhost:8000)
 web_api\.venv\Scripts\activate
-uvicorn web_api.main:app --reload --port 8000
+uvicorn web_api.main:app --reload --port 8000 --loop asyncio:SelectorEventLoop
+#   --loop is required on Windows: psycopg async can't run on the Proactor loop
 
 # Terminal 2 — workers  (--pool=solo REQUIRED on Windows)
 workers\.venv\Scripts\activate
@@ -68,5 +70,9 @@ docker compose down -v                  # WIPE infra volumes
 - ModuleNotFoundError web_api/...  -> not run from repo root, or wrong venv active
 - `import torch` works in web_api  -> bad split; torch belongs ONLY to workers
 - Connection refused 6379/6333     -> infra container not started
+- "Psycopg cannot use ProactorEventLoop" -> start uvicorn with --loop asyncio:SelectorEventLoop
+- Postgres password auth failed    -> .env passwords changed after first init; ALTER ROLE ... PASSWORD
+                                      or (dev only) docker compose down -v to re-run init
+- DB shell: docker exec -it synthetic_data_postgres psql -U postgres -d synthetic_data
 - Credentials endpoints 500        -> ENCRYPTION_KEY missing
 - First academic PDF very slow     -> Marker downloads models once
