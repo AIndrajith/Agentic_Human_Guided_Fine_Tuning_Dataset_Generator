@@ -75,10 +75,11 @@ The result is a clean, exportable fine-tuning dataset in standard formats (Chat,
 ┌────────────────────────────────────────────────────────────────┐
 │                    Data Layer                                   │
 │                                                                  │
-│   MongoDB          Qdrant              Redis                    │
-│   (documents,      (dense +            (Celery broker +         │
-│    QA pairs,       sparse vectors)     LangGraph checkpoints)   │
-│    datasets)                                                    │
+│   PostgreSQL        MinIO            Qdrant         Redis       │
+│   (users, projects, (uploads,        (dense +       (Celery     │
+│    jobs, QA pairs,   extracted text,  sparse         broker)    │
+│    LangGraph         images)          vectors)                  │
+│    checkpoints)                                                 │
 └────────────────────────────────────────────────────────────────┘
          │
          ▼
@@ -99,19 +100,19 @@ The result is a clean, exportable fine-tuning dataset in standard formats (Chat,
 | Phase 1: Document Processing | Ingest, extract, chunk, embed, store | Celery (heavy, blocking tasks) |
 | Phase 2: QA Generation | Generate, retrieve, validate, review, export | LangGraph (agentic, async LLM calls) |
 
-The same Redis instance serves as both the Celery broker and the LangGraph checkpoint store.
+Redis is only the Celery broker. PostgreSQL holds all application state and the LangGraph checkpoints (in a separate `langgraph` schema). MinIO holds files: uploads, extracted text/markdown, and extracted images.
 
 ### 2.3 Provider & Credential System
 
 Every LLM call in the platform — contextualization, embedding, question generation, answer generation, validation, reranking — routes through a single factory (`get_llm_client`) that resolves the right provider and model at runtime. There are no hardcoded API keys anywhere in the code.
 
-**Credential store:** An admin sets API keys through the platform's Credentials configuration page. Keys are encrypted at rest using Fernet symmetric encryption (AES-128) before being stored in MongoDB. The only secret that lives in the environment is the `ENCRYPTION_KEY` used for encryption/decryption. Keys are never returned by any API response — only a status of which fields are present is exposed.
+**Credential store:** Credentials are global, named records (e.g. "OpenAI – team key") that every admin can see and manage. Keys are encrypted at rest with Fernet (AES-128) before being stored in PostgreSQL. The only secret in the environment is the `ENCRYPTION_KEY`. Keys are never returned by any API response — only which fields are present, and which projects use the credential. A credential that is still attached to a project cannot be deleted.
 
-**Per-project model config:** Project owners configure which provider and model to use for each pipeline stage. The six configurable stages are: `question_generator`, `answer_generator`, `validator`, `meta_agent`, `embedder`, and `reranker`. The capability map enforces valid combinations — for example, Anthropic cannot serve the embedder stage since it has no embedding API.
+**Per-project model config:** Project owners attach a credential + model to each pipeline stage. The seven stages are: `question_generator`, `answer_generator`, `validator`, `meta_agent`, `embedder`, `reranker`, and `vision` (image captioning + Marker). The capability map enforces valid combinations — for example, Anthropic cannot serve the embedder stage since it has no embedding API. The embedder stage also records its `embedding_dim`, and is locked once the first document has been embedded.
 
 **Validation:** Before saving a config, the platform pings each stage's provider with a minimal request to catch bad model names or missing credentials immediately, not halfway through a job.
 
-**Workers:** When a Celery task is dispatched, the web API fetches and decrypts the relevant credentials and passes them in the task payload. Workers use the passed credentials, falling back to environment variables if none are provided (backwards-compatible).
+**Workers:** When a Celery task is dispatched, the web API fetches and decrypts the relevant credentials and passes them in the task payload. Workers use the passed credentials, falling back to environment variables if none are provided. Workers never talk to PostgreSQL or MinIO directly: they fetch files and report results through web API `/internal/*` and `/webhooks/*` routes, authenticated with a shared `X-Internal-Token`.
 
 ---
 
@@ -133,7 +134,7 @@ PDF Upload
     ↓
 PyMuPDF → raw text extraction
     ↓
-Stored → MongoDB (ExtractedFictionModel)
+Stored → MinIO (text) + PostgreSQL `extractions` row (key + stats)
     ↓
 Chonkie hierarchical chunking
     ├─ Parent chunks: 30,000 tokens, 5,000 overlap
@@ -143,7 +144,7 @@ GPT-4o-mini contextualization
     └─ Each child chunk gets 50–200 token context description
        generated from its parent window
     ↓
-OpenAI text-embedding-3-large (1536-dim)
+Embedder from project config (dimension = embedding_dim)
     ↓
 BM25 sparse vector generation
     ↓
@@ -170,10 +171,11 @@ Image replacement in markdown
     ├─ Before: ![alt](image.png)
     └─ After: **[IMAGE: alt]**\n{description}\n
     ↓
-Stored → MongoDB (ExtractedAcademicModel)
-    └─ markdown_text (original)
-    └─ enriched_markdown (with image descriptions)
-    └─ images metadata list
+Stored → MinIO + PostgreSQL
+    └─ text.md (original markdown)       → MinIO
+    └─ enriched.md (image descriptions)  → MinIO
+    └─ images                            → MinIO
+    └─ keys, stats, image descriptions   → `extractions` / `extracted_images` rows
     ↓
 Smart markdown-aware chunking
     ├─ Respects heading hierarchy, code blocks, math blocks, tables
@@ -210,7 +212,7 @@ Each point stored in Qdrant:
 Point:
   id: UUID
   vectors:
-    dense:  List[float]  # 1536 dimensions, text-embedding-3-large
+    dense:  List[float]  # embedding_dim from the project config
     sparse: SparseVector # BM25 indices + values
   payload:
     original_text:       str
@@ -252,7 +254,7 @@ QA generation is fundamentally different from document processing:
 
 LangGraph is used for QA generation because:
 - Built-in `interrupt()` for human-in-the-loop (the human review queue)
-- Built-in checkpointing via Redis (same Redis already running) — enables pause/resume
+- Built-in checkpointing to PostgreSQL (`AsyncPostgresSaver`, same database) — enables pause/resume
 - Conditional edges map directly to the score-based routing logic
 - `Send` API enables fan-out to process hundreds of QA chunks in parallel
 - State machine is the natural model for the QA pair lifecycle
@@ -268,14 +270,14 @@ Before question generation begins, documents are re-chunked with different param
 | Size | 800 tokens (child) | 60,000 tokens |
 | Overlap | 5,000 tokens (parent) | None |
 | Purpose | Semantic search target | Question generation input |
-| Storage | Qdrant (permanent) | MongoDB QAChunkModel (temporary) |
-| Source | Original PDF | Extracted text already in MongoDB |
+| Storage | Qdrant (permanent) | PostgreSQL `qa_chunks` (temporary) |
+| Source | Original PDF | Extracted text already in MinIO |
 
 **Why 60,000 tokens?** Standard LLM context windows are ~128k tokens. Half is reserved for the prompt template, generated questions, and system instructions. 60k tokens is dense enough to generate multiple diverse questions while staying within context limits.
 
 **Source for academic documents**: `enriched_markdown` (with image descriptions inlined) — not `markdown_text`. This gives the question generator awareness of visual content.
 
-No re-processing of PDFs. Content is read directly from `ExtractedFictionModel` or `ExtractedAcademicModel` in MongoDB.
+No re-processing of PDFs. Content is read directly from the extracted text in MinIO (located via the `extractions` table).
 
 ### 4.3 LangGraph Graph Structure
 
@@ -284,7 +286,7 @@ No re-processing of PDFs. Content is read directly from `ExtractedFictionModel` 
                     │  chunk_node │
                     │             │
                     │ Fetch from  │
-                    │ MongoDB,    │
+                    │ MinIO,      │
                     │ rechunk to  │
                     │ 60k tokens  │
                     └──────┬──────┘
@@ -433,11 +435,11 @@ Stored on QAPairModel:
 
 ### 4.7 Checkpointing and Pause/Resume
 
-LangGraph persists graph state to Redis on every node transition using a `RedisSaver` checkpointer. Each job is identified by a unique `thread_id` (the `job_id`).
+LangGraph persists graph state to PostgreSQL on every node transition using an `AsyncPostgresSaver` checkpointer (tables in the `langgraph` schema, created by `web_api.scripts.setup_checkpointer`; available at runtime as `app.state.checkpointer`). Each job is identified by a unique `thread_id` (the `job_id`).
 
-- **Pause**: `POST /qa-jobs/{id}/pause` → sets `QAJobModel.status = PAUSED`. LangGraph state already persisted in Redis.
-- **Resume**: `POST /qa-jobs/{id}/resume` → calls `graph.ainvoke` with the same `thread_id`. LangGraph reads from Redis and continues from the last checkpoint.
-- **Server restart**: no data loss. Redis holds the graph state. Job restarts from last checkpoint.
+- **Pause**: `POST /qa-jobs/{id}/pause` → sets `qa_jobs.status = PAUSED`. LangGraph state is already persisted.
+- **Resume**: `POST /qa-jobs/{id}/resume` → calls `graph.ainvoke` with the same `thread_id`. LangGraph reads the checkpoint and continues.
+- **Server restart**: no data loss. PostgreSQL holds the graph state. Job restarts from last checkpoint.
 - **QA pair progress**: pairs already in terminal states (`AUTO_ACCEPTED`, `HUMAN_ACCEPTED`, `AUTO_REJECTED`, `HUMAN_REJECTED`) are skipped on resume.
 
 ### 4.8 Concurrency Control
@@ -540,118 +542,103 @@ A user can simultaneously be a Project Owner of one project and a Worker in anot
 
 ### 6.2 Auth
 
-- JWT-based authentication (`python-jose` + `passlib`)
-- Tokens issued on login, validated via FastAPI dependency injection
-- Project-level role checked per endpoint via project membership lookup
+- Admins invite users by email; the user sets username + password via a one-time setup link (token stored as a SHA-256 hash, 24 h expiry)
+- JWT access tokens (`python-jose`), Argon2 password hashing (`argon2-cffi`)
+- Every request reloads the user, so deactivation takes effect immediately
+- Project-level role checked per endpoint via project membership lookup; admins can access every project; non-members get 404
 
 ---
 
 ## 7. Data Models
 
-All collections in MongoDB using Beanie ODM.
+PostgreSQL tables via SQLAlchemy 2 (async) with Alembic migrations — see `web_api/db/models/` for the source of truth. All ids are UUIDs; all timestamps are `TIMESTAMPTZ`; enums are stored as text with a CHECK constraint. Large content (files, extracted text) lives in MinIO; tables store the object keys.
 
-### 7.1 Existing Models (Phase 1)
+### 7.1 Implemented Tables
 
-#### `DocumentModel` — collection: `documents`
+#### `users`
 ```
-true_title:      str          original filename
-stored_title:    str          UUID-based stored name
-file_type:       FileType     PDF | IMAGES
-file_path:       str          absolute path on disk
-data_catgory:    Datatype     FICTION | ACADEMIC
-project_id:      ObjectId
-```
-
-#### `ProjectModel` — collection: `Project`
-```
-project_title:        str
-project_description:  str
-main_data_type:       Datatype    FICTION | ACADEMIC
+email:                   str        unique, stored lowercase
+username:                str?       unique, set during account setup
+password_hash:           str?       Argon2, set during account setup
+app_role:                AppRole    admin | user
+is_active:               bool
+must_change_password:    bool       true until the invite is accepted
+setup_token_hash:        str?       sha256 of the one-time setup token
+setup_token_expires_at:  datetime?
 ```
 
-#### `ChunkModel` — collection: `chunks`
+#### `email_events`
 ```
-document_id:         ObjectId
-project_id:          ObjectId
-chunk_index:         int
-qdrant_point_id:     str         UUID reference to Qdrant point
-processing_status:   str         pending | processing | completed | failed
-created_at:          datetime
-completed_at:        Optional[datetime]
-error_message:       Optional[str]
-metadata:            Optional[dict]
+user_id → users (cascade), resend_id (unique), kind (invite), sent_at
 ```
 
-#### `ExtractedFictionModel` — collection: `extracted_fiction`
+#### `projects`
 ```
-document_id:          ObjectId
-project_id:           ObjectId
-extracted_text:       str
-character_count:      int
-extraction_metadata:  dict       page_count, extraction_method, file_size
-created_at:           datetime
+title, description
+data_type:          Datatype   fiction | academic
+created_by:         → users (restrict)
+embedding_locked:   bool       true once the first document is embedded
 ```
 
-#### `ExtractedAcademicModel` — collection: `extracted_academic`
+#### `project_members`
 ```
-document_id:           ObjectId
-project_id:            ObjectId
-markdown_text:         str        original Marker output
-enriched_markdown:     str        with image descriptions inlined
-images:                List[ExtractedImageMetadata]
-  └─ filename, file_path, description, position_in_markdown, alt_text
-character_count:       int
-image_count:           int
-extraction_metadata:   dict       marker config, conversion time, file size
-created_at:            datetime
+PK (project_id → projects cascade, user_id → users cascade)
+role:      ProjectRole   owner | worker
+added_by:  → users (set null)
+```
+The creator is added as `owner` in the same transaction; a project always keeps at least one owner.
+
+#### `documents`
+```
+project_id:     → projects (cascade)
+original_name, storage_key (MinIO, unique), file_type (pdf | images),
+content_type, size_bytes
+status:         uploaded | queued | processing | completed | failed
+error, uploaded_by, processed_at
 ```
 
-### 7.2 New Models (Phase 2)
+#### `provider_credentials`
+```
+name:              str        unique, e.g. "OpenAI - team key"
+provider:          ModelProvider
+encrypted_fields:  jsonb      field_name → Fernet token (api_key, endpoint, ...)
+created_by:        → users
+```
+> Global and admin-managed. Keys are write-only from the API.
 
-#### `ProviderCredentialModel` — collection: `provider_credentials`
+#### `project_stage_models`
 ```
-provider:          ModelProvider    openai | anthropic | google | groq | mistral |
-                                    cohere | together | openrouter | azure_openai |
-                                    voyageai | jina | ollama
-encrypted_fields:  dict[str, str]   field_name → Fernet-encrypted value
-                                    (e.g. api_key, endpoint, api_version)
-updated_at:        datetime
-```
-> Keys are write-only from the API. Only field names are returned in status responses, never values.
-
-#### `ProjectModelConfigModel` — collection: `project_model_configs`
-```
-project_id:        ObjectId
-stages:            dict[ModelStage, StageModelConfig]
-                     StageModelConfig: { provider, model_name, base_url? }
-                     Stages: question_generator | answer_generator | validator |
-                             meta_agent | embedder | reranker
-embedding_locked:  bool     True once first document is processed — prevents
-                            provider/model change that would corrupt Qdrant vectors
-created_at:        datetime
-updated_at:        datetime
+PK (project_id → projects cascade, stage)
+credential_id:  → provider_credentials (restrict: in-use credentials can't be deleted)
+model_name, base_url?, embedding_dim? (embedder only)
 ```
 
-#### `UserModel` — collection: `users`
+#### `processing_jobs` / `job_documents`
 ```
-email:            str         unique, indexed
-hashed_password:  str
-app_role:         AppRole     ADMIN | USER
-created_at:       datetime
-```
-
-#### `ProjectMemberModel` — collection: `project_members`
-```
-project_id:    ObjectId
-user_id:       ObjectId
-project_role:  ProjectRole    OWNER | WORKER
-added_by:      ObjectId
-added_at:      datetime
+processing_jobs:  project_id, celery_task_id, status (queued | running | completed | partial | failed),
+                  error, requested_by, started_at, finished_at
+job_documents:    PK (job_id, document_id), status, error
 ```
 
-#### `SkillConfigModel` — collection: `skill_configs`
+#### `extractions` / `extracted_images`
 ```
-project_id:                  ObjectId
+extractions:       document_id (PK), text_key, enriched_key?, char_count, image_count, metadata (jsonb)
+extracted_images:  document_id, filename, storage_key, description, position
+```
+
+#### `chunks`
+```
+document_id → documents (cascade), chunk_index, qdrant_point_id (uuid)
+UNIQUE (document_id, chunk_index)   — a retried document replaces its rows
+```
+
+### 7.2 Planned Tables (Phase 2)
+
+Types below are logical; ids become `UUID` foreign keys when implemented.
+
+#### `SkillConfigModel` — table: `skill_configs`
+```
+project_id:                  UUID
 version:                     int         increments on each save
 question_generator_prompt:   str
 answer_generator_prompt:     str
@@ -660,20 +647,20 @@ base_context:                str         auto-built: project type + doc summarie
 questions_per_chunk:         int
 question_types:              List[QuestionType]   FACTUAL | INFERENTIAL | ANALYTICAL | COT
 approved:                    bool
-approved_by:                 Optional[ObjectId]
+approved_by:                 Optional[UUID]
 approved_at:                 Optional[datetime]
 created_at:                  datetime
 ```
 
-#### `QAJobModel` — collection: `qa_jobs`
+#### `QAJobModel` — table: `qa_jobs`
 ```
-project_id:            ObjectId
-skill_config_id:       ObjectId
+project_id:            UUID
+skill_config_id:       UUID
 skill_config_version:  int
 status:                QAJobStatus
                          CREATED | CHUNKING | RUNNING |
                          PAUSED | COMPLETED | FAILED
-created_by:            ObjectId
+created_by:            UUID
 total_chunks:          int
 processed_chunks:      int         checkpoint: QA chunks completed
 total_questions:       int
@@ -686,11 +673,11 @@ created_at:            datetime
 updated_at:            datetime
 ```
 
-#### `QAChunkModel` — collection: `qa_chunks`
+#### `QAChunkModel` — table: `qa_chunks`
 ```
-job_id:         ObjectId
-project_id:     ObjectId
-document_id:    ObjectId
+job_id:         UUID
+project_id:     UUID
+document_id:    UUID
 chunk_index:    int
 content:        str           60,000 token chunk from extracted content
 token_count:    int
@@ -699,12 +686,12 @@ source_type:    Datatype         FICTION | ACADEMIC
 ```
 > Ephemeral — safe to delete after job completes.
 
-#### `QAPairModel` — collection: `qa_pairs`
+#### `QAPairModel` — table: `qa_pairs`
 ```
-job_id:                   ObjectId
-project_id:               ObjectId
-document_id:              ObjectId
-qa_chunk_id:              ObjectId
+job_id:                   UUID
+project_id:               UUID
+document_id:              UUID
+qa_chunk_id:              UUID
 
 question:                 str
 question_type:            QuestionType    FACTUAL | INFERENTIAL | ANALYTICAL | COT
@@ -730,7 +717,7 @@ status:                   QAPairStatus
 
 user_reflection_comment:  Optional[str]   present = retry mode
 retry_count:              int             max 3, then force AUTO_REJECTED
-reviewed_by:              Optional[ObjectId]
+reviewed_by:              Optional[UUID]
 reviewed_at:              Optional[datetime]
 created_at:               datetime
 updated_at:               datetime
@@ -748,8 +735,8 @@ class ProjectRole(str, Enum):
     WORKER = "worker"
 
 class Datatype(str, Enum):
-    FICTION = "FICTION"
-    ACADEMIC = "ACADEMIC"
+    FICTION = "fiction"
+    ACADEMIC = "academic"
 
 class QuestionType(str, Enum):
     FACTUAL = "FACTUAL"
@@ -791,41 +778,48 @@ class DatasetFormat(str, Enum):
 
 ## 8. API Design
 
-### 8.1 Authentication
+Implemented endpoints are marked ✅; the rest are planned. The live, exact contract is always at `/docs` (Swagger).
+
+### 8.1 Users & Auth ✅
 ```
-POST   /auth/register                       Register new user
-POST   /auth/login                          Returns JWT token
-POST   /auth/logout
-GET    /auth/me                             Current user info
+POST   /users                               Invite a user by email (admin)
+GET    /users                               List users (admin)
+POST   /users/resend-invite                 New setup link; old one stops working (admin)
+PATCH  /users/{user_id}/active              Activate / deactivate (admin)
+POST   /users/setup                         Accept invite: token + username + password
+POST   /users/login                         OAuth2 form (username = email) → JWT
+GET    /users/me                            Current user
 ```
 
-### 8.2 File Management (existing)
+### 8.2 Projects & Members ✅
 ```
-POST   /files/upload                        Upload single PDF
-POST   /files/upload-multiple               Upload multiple PDFs
-GET    /files/{document_id}                 Get document metadata
-GET    /files/                              List all documents
-GET    /files/project/{project_id}          List documents in project
-DELETE /files/{document_id}                 Delete document + physical file
+POST   /projects                            Create (caller becomes owner)
+GET    /projects                            Projects I'm a member of (admin: all)
+GET    /projects/{id}
+PATCH  /projects/{id}                       Owner
+DELETE /projects/{id}                       Owner — cascades documents, config, MinIO files
+
+GET    /projects/{id}/members
+POST   /projects/{id}/members               Add by email (owner)
+PATCH  /projects/{id}/members/{user_id}     Change role (owner)
+DELETE /projects/{id}/members/{user_id}     Remove (owner; last owner can't be removed)
 ```
 
-### 8.3 Project Management (existing, extended)
+### 8.3 Documents ✅
 ```
-POST   /projects/Create-project             Create project
-GET    /projects/get-project/{id}
-GET    /projects/get-all-projects
-PUT    /projects/update-project/{id}
-DELETE /projects/delete-project/{id}
-
-POST   /projects/{id}/members              Add worker to project (owner only)
-DELETE /projects/{id}/members/{user_id}    Remove worker
-GET    /projects/{id}/members              List project members
+POST   /projects/{id}/documents             Upload one or more files (all-or-nothing, content-checked)
+GET    /projects/{id}/documents
+GET    /documents/{document_id}
+DELETE /documents/{document_id}
 ```
 
-### 8.4 Document Processing (existing)
+### 8.4 Document Processing ✅
 ```
-POST   /processing/start                   Submit processing job (Celery)
-GET    /processing/status/{task_id}        Check Celery task status
+POST   /projects/{id}/processing-jobs       Queue documents (no ids = all uploaded/failed)
+GET    /projects/{id}/processing-jobs       List jobs
+GET    /processing-jobs/{job_id}            Job + per-document status
+GET    /projects/{id}/extractions           Extraction summaries
+GET    /documents/{document_id}/extraction  Extracted text / enriched markdown
 ```
 
 ### 8.5 Skill Configuration
@@ -881,39 +875,41 @@ POST   /dataset/{project_id}/export        Body: { format: CHAT | DPO | COT }
                                            Returns: JSONL file download
 ```
 
-### 8.9 Credentials (admin only)
+### 8.9 Credentials ✅
 ```
-GET    /credentials/schema              Field definitions per provider (drives UI forms)
-GET    /credentials/                    Status of all providers — configured true/false,
-                                        field names present, updated_at. No key values.
-POST   /credentials/{provider}          Set/update credentials
-                                        Body: { fields: { api_key: "...", ... } }
-DELETE /credentials/{provider}          Remove credentials
-```
-
-### 8.10 Model Configuration
-```
-POST   /model-config/{project_id}       Set provider + model for each stage
-                                        Body: { stages: { question_generator: { provider, model_name },
-                                                          embedder: { provider, model_name }, ... } }
-GET    /model-config/{project_id}       Get current config
-POST   /model-config/{project_id}/validate  Ping all configured stages live and return
-                                            per-stage pass/fail results
+GET    /credentials/schema              Required fields per provider (drives UI forms)
+GET    /credentials/options             id + name + provider, for any user picking a credential
+GET    /credentials                     All credentials + projects using them (admin). No key values.
+POST   /credentials                     Create: { name, provider, fields } (admin)
+GET    /credentials/{id}                (admin)
+PATCH  /credentials/{id}                Rename / rotate keys (admin)
+DELETE /credentials/{id}                409 if still attached to a project (admin)
 ```
 
-### 8.11 Internal (worker-facing, existing)
+### 8.10 Model Configuration ✅
 ```
-GET    /internal/files/{id}/metadata
-GET    /internal/files/{id}/base64
-GET    /internal/files/{id}/stream
+GET    /projects/{id}/model-config               Current stage assignments
+PUT    /projects/{id}/model-config               Upsert stages (owner)
+                                                 Body: { stages: { embedder: { credential_id, model_name,
+                                                                               embedding_dim }, ... } }
+DELETE /projects/{id}/model-config/{stage}       (owner)
+POST   /projects/{id}/model-config/validate      Live ping per stage; saves nothing
+```
+
+### 8.11 Internal (worker-facing, `X-Internal-Token` required) ✅
+```
+GET    /internal/files/{id}/metadata             Also marks the document as processing
+GET    /internal/files/{id}/base64               Files < 5 MB
+GET    /internal/files/{id}/stream               Any size
 POST   /internal/extracted/fiction
 POST   /internal/extracted/academic/images/{document_id}
 POST   /internal/extracted/academic
 ```
 
-### 8.12 Webhooks (existing)
+### 8.12 Webhooks (worker-facing, `X-Internal-Token` required) ✅
 ```
-POST   /webhooks/processing-complete       Called by Celery workers on completion
+POST   /webhooks/processing-complete       Chunk → Qdrant point links; document + job status
+POST   /webhooks/processing-failed         Marks the document failed with the stage + error
 ```
 
 ---
@@ -925,13 +921,14 @@ POST   /webhooks/processing-complete       Called by Celery workers on completio
 | Component | Technology | Purpose |
 |---|---|---|
 | Web framework | FastAPI | HTTP API, background tasks |
-| Async runtime | asyncio + motor | Non-blocking MongoDB access |
-| ODM | Beanie | MongoDB document models |
-| Database | MongoDB 7 | All persistent storage |
+| Database | PostgreSQL 17 (Docker) | All application state |
+| ORM / driver | SQLAlchemy 2 (async) + psycopg 3 | Typed models, async access |
+| Migrations | Alembic | Versioned schema changes |
+| Object storage | MinIO | Uploads, extracted text, extracted images |
 | Task queue | Celery | Document processing (Phase 1) |
 | Message broker | Redis 7 | Celery broker |
 | QA orchestration | LangGraph | Agentic QA pipeline (Phase 2) |
-| Graph checkpointing | Redis (LangGraph RedisSaver) | Pause/resume state |
+| Graph checkpointing | PostgreSQL (`langgraph-checkpoint-postgres`) | Pause/resume state |
 | Vector database | Qdrant | Dense + sparse vector search |
 | PDF text extraction | PyMuPDF | Fiction documents |
 | PDF → Markdown | Marker CLI | Academic documents |
@@ -941,9 +938,9 @@ POST   /webhooks/processing-complete       Called by Celery workers on completio
 | Vision / Marker LLM | Google Gemini | Image captioning, Marker backend |
 | Reranker | Cohere · Jina · Ollama | Retrieved chunk reranking, configurable per project |
 | Credential encryption | cryptography (Fernet / AES-128) | Encrypt provider API keys at rest |
-| Authentication | python-jose + passlib | JWT tokens, password hashing |
-| HTTP client | httpx | Async HTTP calls |
-| Validation | Pydantic v2 | Request/response schemas |
+| Authentication | python-jose + argon2-cffi | JWT tokens, password hashing |
+| Email | Resend | Invite / setup-password emails |
+| Validation / config | Pydantic v2 + pydantic-settings | Schemas, typed settings from `.env` |
 | Monitoring | Flower (port 5555) | Celery task dashboard |
 | Language | Python 3.11+ | |
 
@@ -951,92 +948,40 @@ POST   /webhooks/processing-complete       Called by Celery workers on completio
 
 ```yaml
 services:
-  redis:        # port 6379 — Celery broker + LangGraph checkpointer
-  qdrant:       # port 6333 — vector database
-  flower:       # port 5555 — Celery monitoring
-  # MongoDB runs separately (Atlas or local)
+  postgres:   # 127.0.0.1:5433 — app DB + LangGraph checkpoints (roles: synth_owner, synth_app)
+  redis:      # port 6379 — Celery broker
+  qdrant:     # port 6333 — vector database
+  minio:      # ports 9000 (API) / 9001 (console) — object storage
+  flower:     # port 5555 — Celery monitoring
 ```
 
-### 9.3 Directory Structure (planned extension)
+Two database roles: `synth_owner` owns the schema and runs migrations; `synth_app` (used by the running API) can only read and write data.
+
+### 9.3 Directory Structure
 
 ```
-d:\Synthetic_Data_Genration\
+├── web_api/                 FastAPI service (own uv project)
+│   ├── main.py              app, lifespan, router registration
+│   ├── core/                settings (pydantic-settings), Celery client
+│   ├── db/                  SQLAlchemy base, session, models/, LangGraph checkpointer
+│   ├── alembic/             migrations
+│   ├── data_models/         Pydantic request/response schemas + enums
+│   ├── deps/                auth, project access, internal-token guard
+│   ├── routers/             HTTP layer
+│   ├── services/            business logic
+│   ├── scripts/             create_admin, setup_checkpointer
+│   ├── tests/               pytest (test database, faked email/MinIO/Celery)
+│   └── qa_pipeline/         LangGraph graph, nodes, state               [PLANNED]
 │
-├── web_api\
-│   ├── main.py
-│   ├── database.py
-│   ├── data_models\
-│   │   ├── BasicBeanieModels.py          DocumentModel, ProjectModel, ChunkModel
-│   │   ├── ExtractedModels.py            ExtractedFictionModel, ExtractedAcademicModel
-│   │   ├── CredentialModels.py           ProviderCredentialModel, schemas
-│   │   ├── ModelConfigModels.py          ProjectModelConfigModel, StageModelConfig
-│   │   ├── UserModels.py                 UserModel, ProjectMemberModel        [NEW]
-│   │   ├── SkillModels.py                SkillConfigModel                     [NEW]
-│   │   ├── QAModels.py                   QAJobModel, QAChunkModel, QAPairModel [NEW]
-│   │   ├── DataModels.py                 Pydantic request/response schemas
-│   │   └── enums.py                      All enums (incl. ModelProvider, ModelStage)
-│   ├── routers\
-│   │   ├── FileMangerRouter.py
-│   │   ├── ProjectMangerRouter.py
-│   │   ├── ProcessingRouter.py
-│   │   ├── WebhookRouter.py
-│   │   ├── InternalRouter.py
-│   │   ├── CredentialRouter.py           /credentials endpoints
-│   │   ├── ModelConfigRouter.py          /model-config endpoints
-│   │   ├── AuthRouter.py                                                      [NEW]
-│   │   ├── SkillRouter.py                                                     [NEW]
-│   │   ├── QAJobRouter.py                                                     [NEW]
-│   │   ├── HumanReviewRouter.py                                               [NEW]
-│   │   └── DatasetRouter.py                                                   [NEW]
-│   ├── services\
-│   │   ├── FileHandlerService.py
-│   │   ├── ProjectHandlerService.py
-│   │   ├── encryption_service.py         Fernet encrypt/decrypt
-│   │   ├── credential_service.py         CRUD for provider credentials
-│   │   ├── llm_factory.py                get_llm_client, call_chat, call_embed, call_rerank
-│   │   ├── ModelConfigService.py         per-project stage config + validation
-│   │   ├── AuthService.py                                                     [NEW]
-│   │   ├── SkillService.py               meta-agent prompt drafting           [NEW]
-│   │   └── DatasetExportService.py       CHAT / DPO / COT export             [NEW]
-│   └── qa_pipeline\                                                           [NEW]
-│       ├── graph.py                      LangGraph graph definition
-│       ├── nodes\
-│       │   ├── chunk_node.py
-│       │   ├── question_gen_node.py
-│       │   ├── answer_gen_node.py
-│       │   └── validate_node.py
-│       ├── edges.py                      Conditional routing logic
-│       └── state.py                      LangGraph state schema
+├── workers/                 Celery document processing (own uv project)
+│   ├── tasks/               orchestrator, fiction_processor, academic_processor
+│   ├── services/            fetch, extract, chunk, contextualize, embed, BM25, Qdrant
+│   └── utils/               temp files, webhook notifier
 │
-├── workers\
-│   ├── celery_app.py
-│   ├── config.py
-│   ├── models.py
-│   ├── enums.py
-│   ├── tasks\
-│   │   ├── orchestrator.py
-│   │   ├── fiction_processor.py
-│   │   └── academic_processor.py
-│   └── services\
-│       ├── file_fetcher.py
-│       ├── text_extractor.py
-│       ├── pdf_to_markdown.py
-│       ├── vision_service.py
-│       ├── chunking_service_fiction.py
-│       ├── chunking_service_academic.py
-│       ├── contextualizer.py
-│       ├── embedding_service.py
-│       ├── bm25_service.py
-│       ├── storage_service.py
-│       ├── extracted_storage_service.py
-│       └── utils\
-│           ├── temp_file_manager.py
-│           └── webhook_notifier.py
-│
-├── docker-compose.yml
-├── pyproject.toml
-├── requirements-worker.txt
-└── .env
+├── front-end/               React + Vite UI
+├── infra/postgres/init/     first-start role/database setup
+├── docs/                    design (this file), development guide, brand kit
+└── docker-compose.yml
 ```
 
 ---
