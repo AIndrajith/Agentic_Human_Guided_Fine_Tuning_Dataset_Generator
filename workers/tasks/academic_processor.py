@@ -74,8 +74,8 @@ class AcademicProcessor:
             )
             
             # ===== 2. Convert PDF → Markdown =====
-            logger.info(f"[{document_id}] Stage: PDF_TO_MARKDOWN")
-            current_stage = "pdf_to_markdown"
+            logger.info(f"[{document_id}] Stage: {ProcessingStage.PDF_TO_MARKDOWN.value}")
+            current_stage = ProcessingStage.PDF_TO_MARKDOWN
             
             marker_output_dir = self.temp_file_manager.get_file_path(
                 task_id,
@@ -95,8 +95,8 @@ class AcademicProcessor:
             
             # ===== 3. Caption Images with Context =====
             if marker_output.images:
-                logger.info(f"[{document_id}] Stage: IMAGE_CAPTIONING")
-                current_stage = "image_captioning"
+                logger.info(f"[{document_id}] Stage: {ProcessingStage.IMAGE_CAPTIONING.value}")
+                current_stage = ProcessingStage.IMAGE_CAPTIONING
                 
                 # Parse markdown to get image references with positions
                 chef = MarkdownChef(tokenizer=Config.CHONKIE_TOKENIZER)
@@ -114,8 +114,9 @@ class AcademicProcessor:
                 logger.info(f"[{document_id}] No images to caption")
             
             # ===== 4. Replace Images with Descriptions =====
-            logger.info(f"[{document_id}] Stage: IMAGE_REPLACEMENT")
-            
+            logger.info(f"[{document_id}] Stage: {ProcessingStage.IMAGE_REPLACEMENT.value}")
+            current_stage = ProcessingStage.IMAGE_REPLACEMENT
+
             enriched_markdown = self._replace_images_with_descriptions(
                 marker_output.markdown_text,
                 image_descriptions
@@ -124,8 +125,8 @@ class AcademicProcessor:
             logger.info(f"[{document_id}] Image replacement complete")
             
             # ===== 4.5. Store Extracted Academic Content =====
-            logger.info(f"[{document_id}] Stage: STORING_EXTRACTED_ACADEMIC")
-            current_stage = "storing_extracted_academic"
+            logger.info(f"[{document_id}] Stage: {ProcessingStage.STORING_EXTRACTED_CONTENT.value}")
+            current_stage = ProcessingStage.STORING_EXTRACTED_CONTENT
             
             try:
                 # Step 1: Upload images to internal API
@@ -213,38 +214,52 @@ class AcademicProcessor:
             logger.info(f"[{document_id}] Stage: {ProcessingStage.GENERATING_BM25.value}")
             current_stage = ProcessingStage.GENERATING_BM25
             
-            sparse_vectors = self.bm25_service.generate_sparse_vectors(combined_texts)
-            
+            sparse_vectors = self.bm25_service.generate_sparse_vectors_batch(combined_texts)
+
             # ===== 9. Store in Qdrant =====
             logger.info(f"[{document_id}] Stage: {ProcessingStage.STORING_VECTORS.value}")
             current_stage = ProcessingStage.STORING_VECTORS
-            
-            await self.storage_service.store_vectors(
-                collection_name=Config.QDRANT_COLLECTION_ACADEMIC,
+
+            point_ids = await self.storage_service.store_chunks(
                 chunks=contextualized_chunks,
                 dense_vectors=dense_vectors,
                 sparse_vectors=sparse_vectors,
                 document_id=document_id,
-                project_id=project_id
+                project_id=project_id,
+                book_metadata=paper_metadata,
+                data_category="academic"
             )
-            
+
             # ===== 10. Notify Completion =====
             logger.info(f"[{document_id}] Stage: {ProcessingStage.NOTIFYING_COMPLETION.value}")
             current_stage = ProcessingStage.NOTIFYING_COMPLETION
-            
-            await self.webhook_notifier.notify_completion(
+
+            chunks_data = [
+                {
+                    "chunk_index": chunk.index,
+                    "qdrant_point_id": point_id,
+                    "metadata": chunk.metadata
+                }
+                for chunk, point_id in zip(contextualized_chunks, point_ids)
+            ]
+
+            await self.webhook_notifier.notify_processing_complete(
                 task_id=task_id,
                 document_id=document_id,
-                status="success"
+                project_id=project_id,
+                status="completed",
+                chunks_processed=len(contextualized_chunks),
+                total_chunks=len(contextualized_chunks),
+                chunks_data=chunks_data
             )
-            
+
             # ===== 11. Cleanup Temp Files =====
-            self.temp_file_manager.cleanup_task_files(task_id)
-            
+            self.temp_file_manager.cleanup_task_directory(task_id, force=True)
+
             logger.info(f"[{document_id}] Processing complete!")
-            
+
             return {
-                "status": "success",
+                "status": "completed",
                 "document_id": document_id,
                 "parent_chunks": len(context_chunks),
                 "child_chunks": len(child_chunks),
@@ -254,15 +269,15 @@ class AcademicProcessor:
             
         except Exception as e:
             logger.error(
-                f"[{document_id}] Failed at stage {current_stage}: {str(e)}",
+                f"[{document_id}] Failed at stage {current_stage.value}: {str(e)}",
                 exc_info=True
             )
 
-            await self.webhook_notifier.notify_completion(
+            await self.webhook_notifier.notify_processing_failed(
                 task_id=task_id,
                 document_id=document_id,
-                status="failed",
-                error=str(e)
+                error_message=str(e),
+                stage=current_stage.value
             )
             
             raise

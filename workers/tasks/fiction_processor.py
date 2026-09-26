@@ -75,8 +75,8 @@ class FictionProcessor:
                 raise ValueError("Extracted text is empty")
 
             # ===== 2.5. Store Extracted Text =====
-            logger.info(f"[{document_id}] Stage: STORING_EXTRACTED_TEXT")
-            current_stage = "storing_extracted_text"
+            logger.info(f"[{document_id}] Stage: {ProcessingStage.STORING_EXTRACTED_CONTENT.value}")
+            current_stage = ProcessingStage.STORING_EXTRACTED_CONTENT
 
             extraction_metadata = {
                 "page_count": self.text_extractor.get_page_count(file_path),

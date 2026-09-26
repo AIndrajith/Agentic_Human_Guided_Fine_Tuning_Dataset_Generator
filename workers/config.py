@@ -3,6 +3,7 @@ Worker configuration and hyperparameters.
 """
 
 import os
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -31,8 +32,9 @@ class Config:
     CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
     
     # ========== Temp File Configuration ==========
-    TEMP_FILE_DIR = os.getenv("TEMP_FILE_DIR", "/tmp/celery_files")
-    TEMP_FILE_RETENTION_HOURS = 1  # Keep failed files for 1 hour
+    # downloaded PDFs + Marker output; defaults to the OS temp dir (works on Windows and Linux)
+    TEMP_FILE_DIR = os.getenv("TEMP_FILE_DIR", str(Path(tempfile.gettempdir()) / "synthetic_data_worker"))
+    TEMP_FILE_RETENTION_HOURS = 6  # failed runs keep their files this long for debugging; swept on worker start
     
     # ========== Chunking Configuration ==========
     CHUNKER_TYPE = ChunkerType.LLAMA_INDEX_SENTENCE
@@ -109,9 +111,6 @@ class Config:
         r"^\d+\.$",  # "1.", "2.", etc.
     ]
 
-    #=========== Acdamic tempory file dir ==========
-    TEMP_FILE_DIR = os.getenv("TEMP_FILE_DIR", "/tmp/celery_files/acdemic")
-    TEMP_FILE_RETENTION_HOURS = 1 
 
 class FictionConfig:
     """Fiction-specific configuration"""

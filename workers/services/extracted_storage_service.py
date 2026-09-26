@@ -92,7 +92,7 @@ class ExtractedContentStorageService:
             
             if not files:
                 logger.warning(f"No valid image files to upload for document {document_id}")
-                return {"document_id": document_id, "images_saved": 0, "saved_paths": []}
+                return {"document_id": document_id, "images_saved": 0, "saved_keys": []}
             
             async with httpx.AsyncClient(headers=Config.internal_headers(), timeout=60.0) as client:  # Longer timeout for file uploads
                 response = await client.post(url, files=files)
