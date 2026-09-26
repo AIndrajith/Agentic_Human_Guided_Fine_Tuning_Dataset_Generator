@@ -3,6 +3,7 @@ Worker configuration and hyperparameters.
 """
 
 import os
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -31,8 +32,9 @@ class Config:
     CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
     
     # ========== Temp File Configuration ==========
-    TEMP_FILE_DIR = os.getenv("TEMP_FILE_DIR", "/tmp/celery_files")
-    TEMP_FILE_RETENTION_HOURS = 1  # Keep failed files for 1 hour
+    # downloaded PDFs + Marker output; defaults to the OS temp dir (works on Windows and Linux)
+    TEMP_FILE_DIR = os.getenv("TEMP_FILE_DIR", str(Path(tempfile.gettempdir()) / "synthetic_data_worker"))
+    TEMP_FILE_RETENTION_HOURS = 6  # failed runs keep their files this long for debugging; swept on worker start
     
     # ========== Chunking Configuration ==========
     CHUNKER_TYPE = ChunkerType.LLAMA_INDEX_SENTENCE
@@ -43,12 +45,13 @@ class Config:
     PARENT_CHUNK_SIZE = 30000  # tokens - context window for LLM
     PARENT_CHUNK_OVERLAP = 5000  # tokens - overlap between parent chunks
     CHILD_CHUNK_SIZE = 800  # tokens - retrieval chunks
-    CHILD_CHUNK_OVERLAP = 100  # tokens - overlap between child chunks
+    CHILD_CHUNK_OVERLAP = 0  # tokens - no child overlap: sentence boundaries + context notes cover the edges,
+                             # and overlap would create near-duplicate chunks (duplicate QA pairs later)
     CHONKIE_TOKENIZER = "o200k_harmony"  # tokenizer for Chonkie
     CHONKIE_MIN_SENTENCES = 1  # minimum sentences per chunk
     
     # ========== Contextual Embedding Configuration ==========
-    LLM_MODEL = "gpt-4o-mini"
+    # Models + keys are per project: fetched from web_api's processing config, not set here.
     LLM_TEMPERATURE = 0.0
     LLM_MAX_CONTEXT_TOKENS = 100_000  # GPT-4o-mini context window
     LLM_TARGET_SECTION_TOKENS = 50_000  # Target size for context sections (deprecated)
@@ -61,30 +64,32 @@ class Config:
     CONTEXT_DESCRIPTION_MAX_TOKENS = 200
     
     # ========== Embedding Configuration ==========
-    EMBEDDING_MODEL = "text-embedding-3-large"
-    EMBEDDING_DIMENSION = 1536
+    # model + vector size come from the project's processing config
     EMBEDDING_BATCH_SIZE = 100  # Batch size for embedding API calls
-    
+
+    # ========== BM25 (keyword search, computed by Qdrant 1.15.2+) ==========
+    BM25_K = 1.2          # how fast repeated words stop adding weight
+    BM25_B = 0.75         # how much long chunks are penalised
+    BM25_AVG_LEN = 400.0  # typical words per chunk after stopword removal (800-token chunk + context note)
+    BM25_LANGUAGE = "english"  # stemming + stopwords
+
     # ========== Qdrant Configuration ==========
-    QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-    QDRANT_COLLECTION_FICTION = "fiction_chunks"
-    QDRANT_COLLECTION_ACADEMIC = "academic_chunks"
-    
-    # ========== OpenAI Configuration ==========
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    
+    QDRANT_UPSERT_BATCH_SIZE = 256  # points per upsert request (keeps requests under Qdrant's size limit)
+    # one collection per project; its name comes from the processing config
+    QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
+
     # ========== Marker Configuration (Academic PDFs) ==========
     MARKER_OUTPUT_FORMAT = "markdown"
-    MARKER_USE_LLM = True
-    MARKER_FORCE_OCR = True
+    MARKER_USE_LLM = True           # uses the project's vision model (see pdf_to_markdown.marker_llm_settings)
+    MARKER_FORCE_OCR = False        # Marker 2 re-OCRs only bad pages/blocks; forcing it is very slow on CPU
     MARKER_REDO_INLINE_MATH = True
-    MARKER_LLM_SERVICE = "marker.services.gemini.GoogleGeminiService"
-    MARKER_TIMEOUT = 120  # seconds
+    MARKER_MODE = os.getenv("MARKER_MODE") or None   # "balanced" | "fast"; None = Marker picks by device
+    MARKER_TIMEOUT = int(os.getenv("MARKER_TIMEOUT", "1800"))  # seconds per PDF
     
     # ========== Vision Model Configuration (Image Captioning) ==========
-    VISION_MODEL_PROVIDER = os.getenv("VISION_MODEL_PROVIDER", "gemini")  # gemini, openai, ollama
-    VISION_MODEL_NAME = "gemini-2.0-flash-exp"
+    # the vision model comes from the project's processing config
     VISION_CONTEXT_WINDOW = 300  # characters before/after image for context
+    # Marker's own LLM step still reads this from .env (moves to the project's vision credential later)
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     
     # ========== Academic Chunking Configuration ==========
@@ -109,9 +114,6 @@ class Config:
         r"^\d+\.$",  # "1.", "2.", etc.
     ]
 
-    #=========== Acdamic tempory file dir ==========
-    TEMP_FILE_DIR = os.getenv("TEMP_FILE_DIR", "/tmp/celery_files/acdemic")
-    TEMP_FILE_RETENTION_HOURS = 1 
 
 class FictionConfig:
     """Fiction-specific configuration"""

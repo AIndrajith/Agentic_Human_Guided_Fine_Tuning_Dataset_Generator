@@ -147,6 +147,21 @@ class CredentialInUse(ConflictError):
     code = "credential_in_use"
 
 
+class RegisteredModelNotFound(NotFoundError):
+    """Model not registered on this connection."""
+    code = "registered_model_not_found"
+
+
+class ModelInUse(ConflictError):
+    """This model is still used by one or more projects."""
+    code = "model_in_use"
+
+
+class ModelTestFailed(ValidationError):
+    """The test call to the model failed."""
+    code = "model_test_failed"
+
+
 def _error_response(status_code: int, code: str, message: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"error": {"code": code, "message": message}})
 

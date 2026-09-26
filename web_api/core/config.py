@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     MINIO_SECURE: bool = False
     MAX_UPLOAD_MB: int = 200
 
+    # ---------- Qdrant ----------
+    # one collection per project (created by the worker, deleted with the project)
+    QDRANT_URL: str = "http://127.0.0.1:6333"
+
     # ---------- Celery / workers ----------
     CELERY_BROKER_URL: str = "redis://localhost:6379/0"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/1"

@@ -104,13 +104,17 @@ Redis is only the Celery broker. PostgreSQL holds all application state and the 
 
 ### 2.3 Provider & Credential System
 
-Every LLM call in the platform — contextualization, embedding, question generation, answer generation, validation, reranking — routes through a single factory (`get_llm_client`) that resolves the right provider and model at runtime. There are no hardcoded API keys anywhere in the code.
+Every LLM call in the platform — contextualization, embedding, question generation, answer generation, validation, reranking — goes through **LiteLLM**, one library with the same call for 100+ providers. The model id (`anthropic/claude-sonnet-4-5`, `ollama_chat/llama3.1`, ...) picks the provider. There are no hardcoded API keys anywhere in the code. Everything provider-specific sits in one registry (`web_api/services/providers.py`); adding a provider is one entry.
 
-**Credential store:** Credentials are global, named records (e.g. "OpenAI – team key") that every admin can see and manage. Keys are encrypted at rest with Fernet (AES-128) before being stored in PostgreSQL. The only secret in the environment is the `ENCRYPTION_KEY`. Keys are never returned by any API response — only which fields are present, and which projects use the credential. A credential that is still attached to a project cannot be deleted.
+**Credential store:** Credentials are global, named connections (e.g. "OpenAI – team key") that every admin can see and manage. Secrets (API keys) are encrypted at rest with Fernet (AES-128); plain settings (Ollama URL, Azure endpoint and API version) are stored as-is and shown on the connection's configuration page. The only secret in the environment is the `ENCRYPTION_KEY`. Keys are never returned by any API response. A credential that is still attached to a project cannot be deleted. Ollama and Azure connections also hold **registered models** (downloaded Ollama models, Azure deployment names), because no catalog can know those.
 
-**Per-project model config:** Project owners attach a credential + model to each pipeline stage. The seven stages are: `question_generator`, `answer_generator`, `validator`, `meta_agent`, `embedder`, `reranker`, and `vision` (image captioning + Marker). The capability map enforces valid combinations — for example, Anthropic cannot serve the embedder stage since it has no embedding API. The embedder stage also records its `embedding_dim`, and is locked once the first document has been embedded.
+**Model discovery:** The model dropdown comes from LiteLLM's model catalog (type, context size, vision support, embedding size), checked against the provider's live model list where the provider has one. Ollama connections sync their list from the server itself. An "Other…" option allows any model name.
 
-**Validation:** Before saving a config, the platform pings each stage's provider with a minimal request to catch bad model names or missing credentials immediately, not halfway through a job.
+**Per-project model config:** Project owners attach a credential + model to each pipeline stage. The seven stages are: `question_generator`, `answer_generator`, `validator`, `meta_agent`, `embedder`, `reranker`, and `vision` (image captioning). Each stage needs one capability (chat, embedding, rerank or vision); a catalog model of the wrong kind is rejected. The embedder's vector size is measured when it is saved, and the embedder is locked once the first document has been embedded.
+
+**Validation:** Before a stage is saved, the platform makes one tiny real call with its model to catch bad model names or keys immediately, not halfway through a job.
+
+**Worker access to keys:** Celery tasks carry only IDs. The worker fetches the project's models and keys from an internal endpoint once per job and keeps them in memory, so keys never sit in Redis.
 
 **Workers:** When a Celery task is dispatched, the web API fetches and decrypts the relevant credentials and passes them in the task payload. Workers use the passed credentials, falling back to environment variables if none are provided. Workers never talk to PostgreSQL or MinIO directly: they fetch files and report results through web API `/internal/*` and `/webhooks/*` routes, authenticated with a shared `X-Internal-Token`.
 
@@ -140,7 +144,7 @@ Chonkie hierarchical chunking
     ├─ Parent chunks: 30,000 tokens, 5,000 overlap
     └─ Child chunks: 800 tokens, no overlap
     ↓
-GPT-4o-mini contextualization
+Contextualization with the project's meta_agent model (any provider, via LiteLLM)
     └─ Each child chunk gets 50–200 token context description
        generated from its parent window
     ↓
@@ -148,7 +152,7 @@ Embedder from project config (dimension = embedding_dim)
     ↓
 BM25 sparse vector generation
     ↓
-Qdrant → collection: fiction_chunks
+Qdrant → the project's collection (project_<id>)
     └─ Each point: dense vector + sparse vector + payload
 ```
 
@@ -157,13 +161,13 @@ Qdrant → collection: fiction_chunks
 ```
 PDF Upload
     ↓
-Marker CLI (PDF → Markdown)
-    ├─ use_llm: true (Google Gemini backend)
-    ├─ force_ocr: true
+Marker 2 (PDF → Markdown), child process
+    ├─ use_llm: the project's vision model (Gemini / OpenAI / Claude / Azure / Ollama / OpenRouter)
+    ├─ selective OCR (only bad pages/blocks; force_ocr off)
     ├─ redo_inline_math: true
     └─ Extracts: markdown text + image files + metadata.json
     ↓
-Gemini Vision → image captioning
+Project's vision model → image captioning
     └─ Each image: surrounding markdown context (300 chars)
        + image file → AI-generated description
     ↓
@@ -182,9 +186,9 @@ Smart markdown-aware chunking
     ├─ Parent chunks: 30,000 tokens, 5,000 overlap
     └─ Child chunks: 800 tokens, no overlap
     ↓
-GPT-4o-mini contextualization → OpenAI embeddings → BM25
+Contextualization → embeddings (project's models) → BM25
     ↓
-Qdrant → collection: academic_chunks
+Qdrant → the project's collection (project_<id>)
 ```
 
 ### 3.4 Chunking Strategy
@@ -193,12 +197,16 @@ The chunking design is hierarchical with a clear separation of roles:
 
 | Level | Size | Overlap | Purpose |
 |---|---|---|---|
-| Parent chunk | 30,000 tokens | 5,000 tokens | Context window for LLM during contextualization and QA generation |
+| Parent chunk | up to 30,000 tokens (fits the meta_agent model) | 1/6 of its size, max 5,000 | Context window for LLM during contextualization and QA generation |
 | Child chunk | 800 tokens | 0 | Retrieval unit — what gets embedded and searched in Qdrant |
 
+- Children are cut **once over the whole document** (positions count from the document start). Each child belongs to exactly **one** parent: the one that contains it where it sits closest to the middle. Parent overlap only adds context; it never duplicates children.
+- Parent and batch size follow the meta_agent model's context window (with a 15% margin), so the whole parent always fits in one call. Ollama models are told the context size they need (`num_ctx`).
+
 Each child chunk goes through contextualization:
-- The parent chunk (30k window) is given to GPT-4o-mini
-- LLM generates a 50–200 token description of the broader context
+- The **whole** parent chunk goes first in the prompt (identical for every batch of that parent, so providers can cache it), then up to 30 children
+- The meta_agent model writes a 50–200 token description per child; a wrong number of descriptions is retried
+- If a batch still fails after its retries, the document fails — no chunk is stored without its note
 - `combined_text = context_description + original_child_text`
 - `combined_text` is what gets embedded — not the raw child text
 
@@ -610,8 +618,16 @@ created_by:        → users
 ```
 PK (project_id → projects cascade, stage)
 credential_id:  → provider_credentials (restrict: in-use credentials can't be deleted)
-model_name, base_url?, embedding_dim? (embedder only)
+model_name, embedding_dim? (embedder only, measured by a test call)
 ```
+
+#### `credential_models`
+```
+credential_id → provider_credentials (cascade), name (Ollama tag / Azure deployment), base_model?,
+capabilities[], embedding_dim?, context_window?, status (untested | ok | failed), last_error?, last_checked_at?
+UNIQUE (credential_id, name)
+```
+> Only for Ollama / Azure connections, whose models can't be looked up in a catalog.
 
 #### `processing_jobs` / `job_documents`
 ```
@@ -890,8 +906,8 @@ DELETE /credentials/{id}                409 if still attached to a project (admi
 ```
 GET    /projects/{id}/model-config               Current stage assignments
 PUT    /projects/{id}/model-config               Upsert stages (owner)
-                                                 Body: { stages: { embedder: { credential_id, model_name,
-                                                                               embedding_dim }, ... } }
+                                                 Body: { stages: { embedder: { credential_id, model_name }, ... } }
+                                                 Each stage is test-called; embedding size is measured
 DELETE /projects/{id}/model-config/{stage}       (owner)
 POST   /projects/{id}/model-config/validate      Live ping per stage; saves nothing
 ```

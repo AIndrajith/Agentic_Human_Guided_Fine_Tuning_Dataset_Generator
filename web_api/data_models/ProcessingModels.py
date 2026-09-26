@@ -4,7 +4,32 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from web_api.data_models.enums import DocumentStatus, JobStatus
+from web_api.data_models.enums import Datatype, DocumentStatus, JobStatus
+
+
+# ---------- worker config (GET /internal/projects/{id}/processing-config; contains secrets) ----------
+
+class WorkerModelEndpoint(BaseModel):
+    """Everything the worker needs for one LiteLLM call."""
+    model:                str                  # LiteLLM model id, e.g. "anthropic/claude-sonnet-4-5"
+    api_key:              Optional[str] = None
+    api_base:             Optional[str] = None
+    api_version:          Optional[str] = None
+    context_window:       Optional[int] = None
+    supports_json_schema: bool = False
+
+
+class WorkerEmbedderEndpoint(WorkerModelEndpoint):
+    dimension: int
+
+
+class WorkerProcessingConfig(BaseModel):
+    project_id:        uuid.UUID
+    data_type:         Datatype
+    qdrant_collection: str
+    llm:               WorkerModelEndpoint              # meta_agent stage: context notes
+    embedder:          WorkerEmbedderEndpoint
+    vision:            Optional[WorkerModelEndpoint] = None   # academic: image descriptions
 
 
 # ---------- user-facing ----------

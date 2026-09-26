@@ -20,7 +20,8 @@ async def get_model_config(project: ProjectMemberAccess, session: SessionDep):
 
 @router.put("", response_model=ModelConfigResponse)
 async def set_model_config(request: SetModelConfigRequest, project: ProjectOwnerAccess, session: SessionDep):
-    """Attach credentials + models to stages (upsert; other stages untouched)."""
+    """Attach credentials + models to stages (upsert; other stages untouched).
+    Each stage is test-called before saving; the embedder's vector size is measured, not typed."""
     return await ModelConfigService(session).set_config(project, request)
 
 

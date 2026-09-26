@@ -3,6 +3,7 @@ import base64
 from pathlib import Path
 from workers.config import Config
 from workers.models import FileMetadata
+from workers.utils.retry import retry_async
 import logging
 
 logger = logging.getLogger(__name__)
@@ -20,14 +21,14 @@ class FileFetcherService:
         save_path: Path
     ) -> FileMetadata:
 
-        metadata = await self._get_file_metadata(document_id)
-        
+        metadata = await retry_async(self._get_file_metadata, document_id, what="fetch file metadata")
+
         if metadata.should_stream:
             logger.info(f"Streaming large file ({metadata.file_size} bytes): {document_id}")
-            await self._fetch_via_stream(document_id, save_path)
+            await retry_async(self._fetch_via_stream, document_id, save_path, what="stream file")
         else:
             logger.info(f"Fetching small file via base64 ({metadata.file_size} bytes): {document_id}")
-            await self._fetch_via_base64(document_id, save_path)
+            await retry_async(self._fetch_via_base64, document_id, save_path, what="fetch file")
         
         return metadata
     

@@ -13,6 +13,7 @@ from web_api.data_models.ProcessingModels import (
     InternalFileMetadata,
     StoreAcademicRequest,
     StoreFictionRequest,
+    WorkerProcessingConfig,
 )
 from web_api.db.models import Document, Project
 from web_api.deps.auth import SessionDep
@@ -78,6 +79,15 @@ async def stream_file(document_id: uuid.UUID, session: SessionDep):
             "X-File-Size": str(metadata.file_size),
         },
     )
+
+
+# ---------- processing config ----------
+
+@router.get("/projects/{project_id}/processing-config", response_model=WorkerProcessingConfig)
+async def get_processing_config(project_id: uuid.UUID, session: SessionDep):
+    """Models, keys, vector size and Qdrant collection for a project. The worker calls this once per job,
+    so keys never travel through Redis. 422 if a required model step isn't configured."""
+    return await ProcessingService(session).build_worker_config(project_id)
 
 
 # ---------- extracted content (writes) ----------

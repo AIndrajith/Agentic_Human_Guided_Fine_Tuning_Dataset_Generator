@@ -14,8 +14,13 @@ class ChunkerType(str, Enum):
 
 class ProcessingStage(str, Enum):
     """Processing pipeline stages"""
+    LOADING_CONFIG = "loading_config"
     FETCHING_FILES = "fetching_files"
     EXTRACTING_TEXT = "extracting_text"
+    PDF_TO_MARKDOWN = "pdf_to_markdown"
+    IMAGE_CAPTIONING = "image_captioning"
+    IMAGE_REPLACEMENT = "image_replacement"
+    STORING_EXTRACTED_CONTENT = "storing_extracted_content"
     DETECTING_CHAPTERS = "detecting_chapters"
     CHUNKING = "chunking"
     CONTEXTUALIZING = "contextualizing"
