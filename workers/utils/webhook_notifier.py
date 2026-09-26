@@ -56,7 +56,7 @@ class WebhookNotifier:
         }
         
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(headers=Config.internal_headers(), timeout=30.0) as client:
                 response = await client.post(url, json=payload)
                 response.raise_for_status()
                 
@@ -94,7 +94,7 @@ class WebhookNotifier:
         }
         
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(headers=Config.internal_headers(), timeout=30.0) as client:
                 response = await client.post(url, json=payload)
                 response.raise_for_status()
                 

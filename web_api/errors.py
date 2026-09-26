@@ -70,6 +70,11 @@ class InvalidOrExpiredToken(AuthenticationError):
     code = "invalid_token"
 
 
+class InvalidInternalToken(AuthenticationError):
+    """Missing or invalid internal token."""
+    code = "invalid_internal_token"
+
+
 class AccountNotActive(AuthorizationError):
     """This account is not active."""
     code = "account_not_active"
@@ -120,6 +125,16 @@ class ProjectAccessDenied(AuthorizationError):
 class MemberNotFound(NotFoundError):
     """This user is not a member of the project."""
     code = "member_not_found"
+
+
+class JobNotFound(NotFoundError):
+    """Processing job not found."""
+    code = "job_not_found"
+
+
+class ExtractionNotFound(NotFoundError):
+    """No extracted content for this document yet."""
+    code = "extraction_not_found"
 
 
 class CredentialNotFound(NotFoundError):

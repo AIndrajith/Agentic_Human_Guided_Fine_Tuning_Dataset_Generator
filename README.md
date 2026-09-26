@@ -73,7 +73,7 @@ Worker reviews ONLY the 5–8 band and takes one action:
 - **Validator scores against grounding.** The retrieved chunks used to write the answer are passed to the validator, so its score has a factual basis.
 - **Thread-per-QA-pair.** Each pair is its own short-lived LangGraph thread (`thread_id`). This isolates concurrency (N workers × M pairs = independent checkpoints, no contention), makes auto-routing fall out naturally, and keeps the retry loop inside one thread. The compiled graph is a process-wide singleton; only the `answer_gen → validate → review` portion lives in the graph — chunking and question generation are plain services.
 - **FIFO, no reservations.** Chunks are either `PENDING` (in queue) or `ASSIGNED`. No browsing, no cherry-picking, no "abandoned" state. Atomic pops guarantee two workers never get the same chunk.
-- **Redis = live queue + LangGraph checkpoints; MongoDB = canonical state.** Jobs are pausable/resumable and survive restarts.
+- **Redis = task queue; PostgreSQL = canonical state + LangGraph checkpoints; MinIO = files and extracted text.** Jobs are pausable/resumable and survive restarts.
 - **Provider-agnostic.** Every LLM / embedding / rerank call routes through one factory, configured per-project per-stage. No hardcoded keys — credentials are Fernet-encrypted at rest.
 
 ---
@@ -101,13 +101,14 @@ Every pair carries full provenance: source chunk & document, assigned worker, sk
 |---|---|
 | Web API | FastAPI + asyncio |
 | Document processing | Celery + Redis broker |
-| QA orchestration | LangGraph (checkpointed to Redis) |
+| QA orchestration | LangGraph (checkpointed to PostgreSQL) |
 | Vector DB | Qdrant (dense + sparse / BM25) |
-| Database | MongoDB (Beanie ODM) |
+| Database | PostgreSQL 17 (SQLAlchemy 2 async + psycopg 3, Alembic migrations) |
+| Object storage | MinIO (uploads, extracted text, images) |
 | Extraction | PyMuPDF (fiction), Marker CLI + Gemini (academic) |
 | Chunking | Chonkie |
 | LLM / Embeddings / Rerank | Configurable per project (OpenAI, Anthropic, Google, Cohere, and more) |
-| Auth | JWT (python-jose + passlib) |
+| Auth | JWT (python-jose) + Argon2 password hashing |
 | Credential encryption | cryptography (Fernet / AES-128) |
 
 ## Export Formats

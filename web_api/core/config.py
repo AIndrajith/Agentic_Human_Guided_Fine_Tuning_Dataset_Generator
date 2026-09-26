@@ -42,9 +42,11 @@ class Settings(BaseSettings):
     MINIO_SECURE: bool = False
     MAX_UPLOAD_MB: int = 200
 
-    # ---------- Celery ----------
+    # ---------- Celery / workers ----------
     CELERY_BROKER_URL: str = "redis://localhost:6379/0"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/1"
+    # shared secret workers send as X-Internal-Token on /internal/* and /webhooks/*
+    INTERNAL_API_TOKEN: SecretStr
 
     # ---------- HTTP ----------
     CORS_ORIGINS: str = "http://localhost:5173"  # comma-separated

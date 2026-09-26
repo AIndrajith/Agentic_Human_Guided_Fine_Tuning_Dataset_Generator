@@ -17,9 +17,6 @@ docker compose up -d            # postgres, redis, qdrant, minio, flower
 # postgres roles (synth_owner / synth_app) are created on FIRST start only,
 # from infra/postgres/init/01-roles.sh using the passwords in .env
 
-# (legacy, until the Mongo -> Postgres migration is finished)
-docker run -d --name synthetic_data_mongo -p 27017:27017 -v mongo_data:/data/db mongo:7
-
 # every time after:
 docker compose start
 
@@ -75,7 +72,6 @@ Flower: http://localhost:5555
 ----------------------------------------------------------------
 # Ctrl+C the two service terminals
 docker compose stop                     # stop infra (keep data)
-docker stop synthetic_data_mongo
 docker compose down -v                  # WIPE infra volumes
 
 ----------------------------------------------------------------

@@ -26,7 +26,10 @@ from sqlalchemy import text  # noqa: E402
 from web_api.data_models.enums import AppRole  # noqa: E402
 from web_api.db.session import get_sessionmaker  # noqa: E402
 from web_api.main import app  # noqa: E402
+from web_api.routers import InternalRouter as internal_module  # noqa: E402
+from web_api.services import ExtractionService as extraction_module  # noqa: E402
 from web_api.services import FileHandlerService as file_module  # noqa: E402
+from web_api.services import ProcessingService as processing_module  # noqa: E402
 from web_api.tests.helpers import create_user, login  # noqa: E402
 
 WEB_API_DIR = Path(__file__).resolve().parents[1]
@@ -73,6 +76,25 @@ class FakeMinio:
             del self.objects[k]
         return len(keys)
 
+    async def download(self, key):
+        return self.objects[key]
+
+    async def stat(self, key):
+        class _Stat:
+            size = len(self.objects[key])
+        return _Stat()
+
+    async def stream(self, key):
+        yield self.objects[key]
+
+
+class FakeCelery:
+    def __init__(self):
+        self.sent: list[dict] = []
+
+    def send_task(self, name, args=None, task_id=None):
+        self.sent.append({"name": name, "payload": args[0], "task_id": task_id})
+
 
 @pytest.fixture(scope="session")
 async def app_client():
@@ -92,8 +114,22 @@ def email(app_client):
 @pytest.fixture
 def minio(monkeypatch):
     fake = FakeMinio()
-    monkeypatch.setattr(file_module, "minio_service", fake)
+    # every module that did `from ...MinioService import minio_service`
+    for module in (file_module, extraction_module, internal_module):
+        monkeypatch.setattr(module, "minio_service", fake)
     return fake
+
+
+@pytest.fixture
+def celery(monkeypatch):
+    fake = FakeCelery()
+    monkeypatch.setattr(processing_module, "get_celery", lambda: fake)
+    return fake
+
+
+@pytest.fixture
+def internal_headers():
+    return {"X-Internal-Token": get_settings().INTERNAL_API_TOKEN.get_secret_value()}
 
 
 @pytest.fixture(autouse=True)

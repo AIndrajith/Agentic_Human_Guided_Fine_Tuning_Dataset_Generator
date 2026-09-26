@@ -1,4 +1,4 @@
-"""Processing pipeline tables. Created now; wired up in the processing phase."""
+"""Processing pipeline tables: jobs, per-document job status, extracted content, chunk links."""
 import uuid
 from datetime import datetime
 from typing import Any

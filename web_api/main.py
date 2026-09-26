@@ -12,9 +12,12 @@ from web_api.db.session import dispose_engine
 from web_api.errors import register_error_handlers
 from web_api.routers.CredentialRouter import router as credential_router
 from web_api.routers.FileMangerRouter import router as file_router
+from web_api.routers.InternalRouter import router as internal_router
 from web_api.routers.ModelConfigRouter import router as model_config_router
+from web_api.routers.ProcessingRouter import router as processing_router
 from web_api.routers.ProjectMangerRouter import router as project_router
 from web_api.routers.UserRouter import router as user_router
+from web_api.routers.WebhookRouter import router as webhook_router
 from web_api.services.EmailService import EmailService
 from web_api.services.JWTService import JWTService
 from web_api.services.MinioService import minio_service
@@ -66,7 +69,10 @@ app.include_router(project_router)
 app.include_router(file_router)
 app.include_router(credential_router)
 app.include_router(model_config_router)
-# Not registered yet (still on MongoDB, ported next phase): ProcessingRouter, InternalRouter, WebhookRouter
+app.include_router(processing_router)
+# worker-only (X-Internal-Token)
+app.include_router(internal_router)
+app.include_router(webhook_router)
 
 
 @app.get("/")

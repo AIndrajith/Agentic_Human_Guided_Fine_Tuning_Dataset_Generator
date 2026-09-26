@@ -34,7 +34,7 @@ class FileFetcherService:
     async def _get_file_metadata(self, document_id: str) -> FileMetadata:
         url = f"{self.api_base_url}/internal/files/{document_id}/metadata"
         
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(headers=Config.internal_headers(), timeout=30.0) as client:
             response = await client.get(url)
             response.raise_for_status()
             data = response.json()
@@ -44,7 +44,7 @@ class FileFetcherService:
 
         url = f"{self.api_base_url}/internal/files/{document_id}/base64"
         
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(headers=Config.internal_headers(), timeout=60.0) as client:
             response = await client.get(url)
             response.raise_for_status()
             data = response.json()
@@ -60,7 +60,7 @@ class FileFetcherService:
         
         save_path.parent.mkdir(parents=True, exist_ok=True)
         
-        async with httpx.AsyncClient(timeout=300.0) as client:  # 5 min timeout for large files
+        async with httpx.AsyncClient(headers=Config.internal_headers(), timeout=300.0) as client:  # 5 min timeout for large files
             async with client.stream("GET", url) as response:
                 response.raise_for_status()
                 

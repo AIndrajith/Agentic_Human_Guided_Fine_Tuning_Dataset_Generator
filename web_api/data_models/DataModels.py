@@ -1,7 +1,6 @@
 """API request/response schemas (Pydantic). ORM tables live in web_api/db/models."""
 import uuid
 from datetime import datetime
-from typing import List
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
@@ -115,10 +114,3 @@ class DocumentResponse(_ORMModel):
     uploaded_by: uuid.UUID | None
     created_at: datetime
     processed_at: datetime | None
-
-
-# ---------- Processing (router ported next phase) ----------
-
-class ProcessDocumentsRequest(BaseModel):
-    project_id: str
-    document_ids: List[str]
