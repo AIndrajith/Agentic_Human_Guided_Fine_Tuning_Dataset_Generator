@@ -1,5 +1,10 @@
+import logging
+
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
+
+logger = logging.getLogger(__name__)
 
 
 class AppError(Exception):
@@ -65,6 +70,11 @@ class InvalidOrExpiredToken(AuthenticationError):
     code = "invalid_token"
 
 
+class InvalidInternalToken(AuthenticationError):
+    """Missing or invalid internal token."""
+    code = "invalid_internal_token"
+
+
 class AccountNotActive(AuthorizationError):
     """This account is not active."""
     code = "account_not_active"
@@ -101,17 +111,58 @@ class UnsupportedFileType(BadRequestError):
     code = "unsupported_file_type"
 
 
+class FileTooLarge(AppError):
+    """The uploaded file is too large."""
+    status_code = 413
+    code = "file_too_large"
+
+
+class ProjectAccessDenied(AuthorizationError):
+    """You do not have access to this project."""
+    code = "project_access_denied"
+
+
+class MemberNotFound(NotFoundError):
+    """This user is not a member of the project."""
+    code = "member_not_found"
+
+
+class JobNotFound(NotFoundError):
+    """Processing job not found."""
+    code = "job_not_found"
+
+
+class ExtractionNotFound(NotFoundError):
+    """No extracted content for this document yet."""
+    code = "extraction_not_found"
+
+
+class CredentialNotFound(NotFoundError):
+    """Credential not found."""
+    code = "credential_not_found"
+
+
+class CredentialInUse(ConflictError):
+    """This credential is still attached to one or more projects."""
+    code = "credential_in_use"
+
+
+def _error_response(status_code: int, code: str, message: str) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={"error": {"code": code, "message": message}})
+
+
 def register_error_handlers(app) -> None:
     @app.exception_handler(AppError)
     async def _handle_app_error(request: Request, exc: AppError):
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={"error": {"code": exc.code, "message": exc.message}},
-        )
+        return _error_response(exc.status_code, exc.code, exc.message)
+
+    @app.exception_handler(IntegrityError)
+    async def _handle_integrity_error(request: Request, exc: IntegrityError):
+        # a unique/foreign-key constraint a service didn't pre-check (e.g. a race)
+        logger.warning("Integrity error on %s %s: %s", request.method, request.url.path, exc.orig)
+        return _error_response(409, "conflict", "The request conflicts with existing data")
 
     @app.exception_handler(Exception)
     async def _handle_unexpected(request: Request, exc: Exception):
-        return JSONResponse(
-            status_code=500,
-            content={"error": {"code": "internal_error", "message": "Internal server error"}},
-        )
+        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+        return _error_response(500, "internal_error", "Internal server error")

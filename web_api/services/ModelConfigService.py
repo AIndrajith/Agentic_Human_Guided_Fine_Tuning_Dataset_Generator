@@ -1,93 +1,116 @@
-from fastapi import HTTPException
-from beanie import PydanticObjectId
-from datetime import datetime
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from web_api.data_models.enums import ModelProvider, ModelStage
 from web_api.data_models.ModelConfigModels import (
-    ProjectModelConfigModel,
+    ModelConfigResponse,
     SetModelConfigRequest,
+    StageModelConfig,
+    StageModelResponse,
     StageValidationResult,
     ValidateModelConfigResponse,
 )
-from web_api.data_models.enums import ModelStage
+from web_api.db.models import Project, ProjectStageModel, ProviderCredential
+from web_api.errors import ConflictError, CredentialNotFound, ValidationError
+from web_api.services.credential_service import CredentialService
 from web_api.services.llm_factory import STAGE_CAPABILITIES, ping_stage
 
 
 class ModelConfigService:
+    """Per-project stage -> (global credential, model) assignments."""
 
-    @staticmethod
-    async def set_config(project_id: str, request: SetModelConfigRequest) -> ProjectModelConfigModel:
-        obj_id = PydanticObjectId(project_id)
-        existing = await ProjectModelConfigModel.find_one(
-            ProjectModelConfigModel.project_id == obj_id
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def get_config(self, project: Project) -> ModelConfigResponse:
+        rows = await self.session.execute(
+            select(ProjectStageModel, ProviderCredential)
+            .join(ProviderCredential, ProviderCredential.id == ProjectStageModel.credential_id)
+            .where(ProjectStageModel.project_id == project.id)
+            .order_by(ProjectStageModel.stage)
+        )
+        return ModelConfigResponse(
+            project_id=project.id,
+            embedding_locked=project.embedding_locked,
+            stages=[
+                StageModelResponse(
+                    stage=stage_model.stage,
+                    credential_id=credential.id,
+                    credential_name=credential.name,
+                    provider=credential.provider,
+                    model_name=stage_model.model_name,
+                    base_url=stage_model.base_url,
+                    embedding_dim=stage_model.embedding_dim,
+                    updated_at=stage_model.updated_at,
+                )
+                for stage_model, credential in rows
+            ],
         )
 
-        if existing and existing.embedding_locked and ModelStage.EMBEDDER in request.stages:
-            new_embed = request.stages[ModelStage.EMBEDDER]
-            old_embed = existing.stages.get(ModelStage.EMBEDDER.value)
-            if old_embed and (
-                new_embed.provider != old_embed.provider or
-                new_embed.model_name != old_embed.model_name
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Embedder config is locked after first document was processed. "
-                        "Changing it would corrupt existing Qdrant vectors."
-                    )
-                )
+    async def _check_stage(self, stage: ModelStage, config: StageModelConfig) -> ModelProvider:
+        """Credential exists and its provider can serve the stage. Returns the provider."""
+        credential = await self.session.get(ProviderCredential, config.credential_id)
+        if not credential:
+            raise CredentialNotFound(f"Credential {config.credential_id} not found (stage '{stage.value}')")
+        allowed = STAGE_CAPABILITIES.get(stage, set())
+        if credential.provider not in allowed:
+            raise ValidationError(
+                f"Provider '{credential.provider.value}' cannot serve stage '{stage.value}'. "
+                f"Allowed: {sorted(p.value for p in allowed)}"
+            )
+        if stage == ModelStage.EMBEDDER and not config.embedding_dim:
+            raise ValidationError("embedding_dim is required for the embedder stage")
+        if stage != ModelStage.EMBEDDER and config.embedding_dim:
+            raise ValidationError("embedding_dim is only allowed on the embedder stage")
+        return credential.provider
 
+    async def set_config(self, project: Project, request: SetModelConfigRequest) -> ModelConfigResponse:
+        """Upsert the given stages; stages not in the request are left unchanged."""
         for stage, config in request.stages.items():
-            allowed = STAGE_CAPABILITIES.get(stage, set())
-            if config.provider not in allowed:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Provider '{config.provider}' cannot serve stage '{stage}'. "
-                           f"Allowed: {[p.value for p in allowed]}"
+            await self._check_stage(stage, config)
+
+            existing = await self.session.get(ProjectStageModel, (project.id, stage))
+            if stage == ModelStage.EMBEDDER and project.embedding_locked and existing and (
+                existing.credential_id != config.credential_id
+                or existing.model_name != config.model_name
+                or existing.embedding_dim != config.embedding_dim
+            ):
+                raise ConflictError(
+                    "Embedder is locked after the first document was processed; "
+                    "changing it would make existing vectors incompatible."
                 )
 
-        stages_dict = {stage.value: config for stage, config in request.stages.items()}
+            if existing:
+                existing.credential_id = config.credential_id
+                existing.model_name = config.model_name
+                existing.base_url = config.base_url
+                existing.embedding_dim = config.embedding_dim
+            else:
+                self.session.add(ProjectStageModel(project_id=project.id, stage=stage, **config.model_dump()))
 
+        await self.session.commit()
+        return await self.get_config(project)
+
+    async def remove_stage(self, project: Project, stage: ModelStage) -> None:
+        if stage == ModelStage.EMBEDDER and project.embedding_locked:
+            raise ConflictError("Embedder is locked after the first document was processed")
+        existing = await self.session.get(ProjectStageModel, (project.id, stage))
         if existing:
-            existing.stages.update(stages_dict)
-            existing.updated_at = datetime.utcnow()
-            await existing.save()
-            return existing
+            await self.session.delete(existing)
+            await self.session.commit()
 
-        config_doc = ProjectModelConfigModel(project_id=obj_id, stages=stages_dict)
-        await config_doc.insert()
-        return config_doc
-
-    @staticmethod
-    async def get_config(project_id: str) -> ProjectModelConfigModel:
-        obj_id = PydanticObjectId(project_id)
-        config = await ProjectModelConfigModel.find_one(
-            ProjectModelConfigModel.project_id == obj_id
-        )
-        if not config:
-            raise HTTPException(status_code=404, detail="No model config found for this project")
-        return config
-
-    @staticmethod
-    async def validate_config(project_id: str, request: SetModelConfigRequest) -> ValidateModelConfigResponse:
+    async def validate_config(self, request: SetModelConfigRequest) -> ValidateModelConfigResponse:
+        """Dry run: check each stage and make a tiny live call. Saves nothing."""
+        credentials = CredentialService(self.session)
         results: list[StageValidationResult] = []
 
         for stage, config in request.stages.items():
-            allowed = STAGE_CAPABILITIES.get(stage, set())
-            if config.provider not in allowed:
-                results.append(StageValidationResult(
-                    stage=stage,
-                    ok=False,
-                    error=f"Provider '{config.provider}' cannot serve stage '{stage}'"
-                ))
-                continue
-
             try:
-                await ping_stage(config.provider, config.model_name, stage, config)
+                await self._check_stage(stage, config)
+                provider, creds = await credentials.get_decrypted_fields(config.credential_id)
+                await ping_stage(provider, creds, config.model_name, stage, config.base_url)
                 results.append(StageValidationResult(stage=stage, ok=True))
             except Exception as e:
                 results.append(StageValidationResult(stage=stage, ok=False, error=str(e)))
 
-        return ValidateModelConfigResponse(
-            all_ok=all(r.ok for r in results),
-            results=results,
-        )
+        return ValidateModelConfigResponse(all_ok=all(r.ok for r in results), results=results)

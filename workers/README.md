@@ -6,8 +6,9 @@ Celery document-processing workers. Independent uv project
 > Run from the **repo root**, not this folder, so `workers.*` imports resolve.
 
 ## Containers needed
-Redis (broker) · Qdrant · MinIO · MongoDB  + `web_api` running
-(workers fetch files & post results via web_api `/internal/*` and webhooks).
+Redis (broker) · Qdrant  + `web_api` running
+(workers never touch Postgres/MinIO directly: they fetch files & post results via
+web_api `/internal/*` and webhooks, authenticated with `X-Internal-Token`).
 
 ## Install
 ```
@@ -27,8 +28,9 @@ workers\.venv\Scripts\celery.exe -A workers.celery_app worker --loglevel=info --
 `--pool=solo` is **required** on Windows.
 
 ## Env (shared root `.env`)
-`OPENAI_API_KEY`, `GEMINI_API_KEY`, `MONGODB_URL`, `MINIO_*`, `QDRANT_URL`,
-`CELERY_BROKER_URL`, `WEB_API_URL`
+`INTERNAL_API_TOKEN` (must match web_api), `WEB_API_URL`, `QDRANT_URL`, `CELERY_BROKER_URL`,
+plus fallback `OPENAI_API_KEY` / `GEMINI_API_KEY` (used only when a project has no stage config).
+Loaded automatically from the repo-root `.env`.
 
 ## Notes
 - First academic PDF run is slow — Marker downloads models once, then caches.

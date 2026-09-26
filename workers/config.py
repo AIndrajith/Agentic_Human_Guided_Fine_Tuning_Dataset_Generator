@@ -3,15 +3,28 @@ Worker configuration and hyperparameters.
 """
 
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
 from workers.enums import ChunkerType
+
+# shared repo-root .env (same file web_api reads); real env vars take precedence
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
 class Config:
     """Global worker configuration"""
-    
+
     # ========== API Configuration ==========
     WEB_API_BASE_URL = os.getenv("WEB_API_URL", "http://localhost:8000")
     FILE_SIZE_THRESHOLD = 5 * 1024 * 1024  # 5MB
+    # sent as X-Internal-Token on every web_api /internal/* and /webhooks/* call
+    INTERNAL_API_TOKEN = os.getenv("INTERNAL_API_TOKEN", "")
+
+    @classmethod
+    def internal_headers(cls) -> dict:
+        return {"X-Internal-Token": cls.INTERNAL_API_TOKEN}
     
     # ========== Celery Configuration ==========
     CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")

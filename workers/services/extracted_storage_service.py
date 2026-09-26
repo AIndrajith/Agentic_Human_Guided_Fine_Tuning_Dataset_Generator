@@ -29,7 +29,7 @@ class ExtractedContentStorageService:
         extraction_metadata: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        Store extracted fiction text in MongoDB.
+        Store extracted fiction text (web_api saves it to MinIO + Postgres).
         
         Args:
             document_id: Document ID
@@ -50,7 +50,7 @@ class ExtractedContentStorageService:
         }
         
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with httpx.AsyncClient(headers=Config.internal_headers(), timeout=self.timeout) as client:
                 response = await client.post(url, json=payload)
                 response.raise_for_status()
                 
@@ -94,7 +94,7 @@ class ExtractedContentStorageService:
                 logger.warning(f"No valid image files to upload for document {document_id}")
                 return {"document_id": document_id, "images_saved": 0, "saved_paths": []}
             
-            async with httpx.AsyncClient(timeout=60.0) as client:  # Longer timeout for file uploads
+            async with httpx.AsyncClient(headers=Config.internal_headers(), timeout=60.0) as client:  # Longer timeout for file uploads
                 response = await client.post(url, files=files)
                 response.raise_for_status()
                 
@@ -121,7 +121,7 @@ class ExtractedContentStorageService:
         extraction_metadata: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        Store extracted academic content (markdown + image metadata) in MongoDB.
+        Store extracted academic content (web_api saves it to MinIO + Postgres).
         
         Args:
             document_id: Document ID
@@ -146,7 +146,7 @@ class ExtractedContentStorageService:
         }
         
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with httpx.AsyncClient(headers=Config.internal_headers(), timeout=self.timeout) as client:
                 response = await client.post(url, json=payload)
                 response.raise_for_status()
                 

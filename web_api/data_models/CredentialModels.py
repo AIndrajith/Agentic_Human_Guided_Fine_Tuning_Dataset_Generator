@@ -1,8 +1,8 @@
-from beanie import Document
-from pydantic import BaseModel
-from typing import Optional
+import uuid
 from datetime import datetime
-from pydantic import Field
+
+from pydantic import BaseModel, ConfigDict, Field
+
 from web_api.data_models.enums import ModelProvider
 
 
@@ -22,24 +22,41 @@ PROVIDER_CREDENTIAL_SCHEMA: dict[ModelProvider, list[str]] = {
 }
 
 
-class ProviderCredentialModel(Document):
-    provider:         ModelProvider
-    encrypted_fields: dict[str, str]
-    updated_at:       datetime = Field(default_factory=datetime.utcnow)
-
-    class Settings:
-        name = "provider_credentials"
-
-
-class SetCredentialRequest(BaseModel):
+class CreateCredentialRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    provider: ModelProvider
     fields: dict[str, str]
 
 
-class CredentialStatusResponse(BaseModel):
-    provider:       ModelProvider
-    configured:     bool
+class UpdateCredentialRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    fields: dict[str, str] | None = None   # replaces all secret fields when given
+
+
+class CredentialProjectRef(BaseModel):
+    project_id: uuid.UUID
+    title: str
+
+
+class CredentialResponse(BaseModel):
+    """Never includes secret values."""
+    id: uuid.UUID
+    name: str
+    provider: ModelProvider
     fields_present: list[str]
-    updated_at:     Optional[datetime]
+    used_by_projects: list[CredentialProjectRef]
+    created_by: uuid.UUID | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class CredentialOptionResponse(BaseModel):
+    """What project owners see when picking a credential for a stage."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    provider: ModelProvider
 
 
 class ProviderSchemaResponse(BaseModel):

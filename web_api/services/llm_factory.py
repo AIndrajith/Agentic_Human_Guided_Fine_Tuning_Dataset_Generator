@@ -8,11 +8,14 @@ from anthropic import AsyncAnthropic
 import cohere
 import httpx
 
+import uuid
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from web_api.data_models.enums import ModelProvider, ModelStage
-from web_api.data_models.ModelConfigModels import ProjectModelConfigModel, StageModelConfig
+from web_api.db.models import ProjectStageModel
+from web_api.errors import NotFoundError
 from web_api.services.credential_service import CredentialService
-from beanie import PydanticObjectId
-from fastapi import HTTPException
 
 
 STAGE_CAPABILITIES: dict[ModelStage, set[ModelProvider]] = {
@@ -47,6 +50,9 @@ STAGE_CAPABILITIES: dict[ModelStage, set[ModelProvider]] = {
     ModelStage.RERANKER: {
         ModelProvider.COHERE, ModelProvider.JINA, ModelProvider.OLLAMA,
     },
+    ModelStage.VISION: {
+        ModelProvider.GOOGLE, ModelProvider.OPENAI,
+    },
 }
 
 _OPENAI_COMPAT_BASE_URLS = {
@@ -65,9 +71,10 @@ class LLMClientWrapper:
     extra:      dict = field(default_factory=dict)
 
 
-async def _build_client(provider: ModelProvider, model_name: str, stage_config: StageModelConfig = None) -> LLMClientWrapper:
-    creds = await CredentialService.get_decrypted_fields(provider)
-
+def build_client(
+    provider: ModelProvider, creds: dict[str, str], model_name: str, base_url: str | None = None
+) -> LLMClientWrapper:
+    """`creds` = a credential's decrypted fields; `base_url` = optional per-stage override."""
     match provider:
         case ModelProvider.OPENAI:
             client = AsyncOpenAI(api_key=creds["api_key"])
@@ -94,8 +101,9 @@ async def _build_client(provider: ModelProvider, model_name: str, stage_config: 
             return LLMClientWrapper(provider, client, model_name, extra={"api_version": creds["api_version"]})
 
         case ModelProvider.OLLAMA:
-            base_url = (stage_config.base_url if stage_config else None) or creds.get("base_url", "http://localhost:11434/v1")
-            client = AsyncOpenAI(api_key="ollama", base_url=base_url)
+            client = AsyncOpenAI(
+                api_key="ollama", base_url=base_url or creds.get("base_url", "http://localhost:11434/v1")
+            )
             return LLMClientWrapper(provider, client, model_name)
 
         case ModelProvider.VOYAGEAI:
@@ -111,19 +119,12 @@ async def _build_client(provider: ModelProvider, model_name: str, stage_config: 
             return LLMClientWrapper(provider, client, model_name)
 
 
-async def get_llm_client(project_id: str, stage: ModelStage) -> LLMClientWrapper:
-    obj_id = PydanticObjectId(project_id)
-    config_doc = await ProjectModelConfigModel.find_one(
-        ProjectModelConfigModel.project_id == obj_id
-    )
-    if not config_doc:
-        raise HTTPException(status_code=404, detail="No model config set for this project")
-
-    stage_config = config_doc.stages.get(stage.value)
-    if not stage_config:
-        raise HTTPException(status_code=404, detail=f"No config for stage: {stage.value}")
-
-    return await _build_client(stage_config.provider, stage_config.model_name, stage_config)
+async def get_llm_client(session: AsyncSession, project_id: uuid.UUID, stage: ModelStage) -> LLMClientWrapper:
+    stage_model = await session.get(ProjectStageModel, (project_id, stage))
+    if not stage_model:
+        raise NotFoundError(f"No model configured for stage: {stage.value}")
+    provider, creds = await CredentialService(session).get_decrypted_fields(stage_model.credential_id)
+    return build_client(provider, creds, stage_model.model_name, stage_model.base_url)
 
 
 async def call_chat(
@@ -262,9 +263,11 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
 
 
-async def ping_stage(provider: ModelProvider, model_name: str, stage: ModelStage, stage_config=None) -> None:
+async def ping_stage(
+    provider: ModelProvider, creds: dict[str, str], model_name: str, stage: ModelStage, base_url: str | None = None
+) -> None:
     """Raises if provider is unreachable or credentials are invalid."""
-    wrapper = await _build_client(provider, model_name, stage_config)
+    wrapper = build_client(provider, creds, model_name, base_url)
 
     if stage == ModelStage.EMBEDDER:
         await call_embed(wrapper, "test")

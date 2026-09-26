@@ -150,7 +150,7 @@ class AcademicProcessor:
                     for img in marker_output.images
                 ]
                 
-                # Step 3: Store markdown and metadata in MongoDB
+                # Step 3: Store markdown and metadata via web_api
                 extraction_metadata = {
                     "marker_config": marker_output.metadata["marker_config"],
                     "character_count": len(enriched_markdown),
@@ -166,7 +166,7 @@ class AcademicProcessor:
                     images=image_metadata_list,
                     extraction_metadata=extraction_metadata
                 )
-                logger.info(f"[{document_id}] Successfully stored academic content in MongoDB")
+                logger.info(f"[{document_id}] Stored academic content via web_api")
                 
             except Exception as e:
                 logger.error(f"[{document_id}] Failed to store academic content: {str(e)}")
