@@ -50,7 +50,7 @@ class Config:
     CHONKIE_MIN_SENTENCES = 1  # minimum sentences per chunk
     
     # ========== Contextual Embedding Configuration ==========
-    LLM_MODEL = "gpt-4o-mini"
+    # Models + keys are per project: fetched from web_api's processing config, not set here.
     LLM_TEMPERATURE = 0.0
     LLM_MAX_CONTEXT_TOKENS = 100_000  # GPT-4o-mini context window
     LLM_TARGET_SECTION_TOKENS = 50_000  # Target size for context sections (deprecated)
@@ -63,18 +63,13 @@ class Config:
     CONTEXT_DESCRIPTION_MAX_TOKENS = 200
     
     # ========== Embedding Configuration ==========
-    EMBEDDING_MODEL = "text-embedding-3-large"
-    EMBEDDING_DIMENSION = 1536
+    # model + vector size come from the project's processing config
     EMBEDDING_BATCH_SIZE = 100  # Batch size for embedding API calls
-    
+
     # ========== Qdrant Configuration ==========
-    QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-    QDRANT_COLLECTION_FICTION = "fiction_chunks"
-    QDRANT_COLLECTION_ACADEMIC = "academic_chunks"
-    
-    # ========== OpenAI Configuration ==========
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    
+    # one collection per project; its name comes from the processing config
+    QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
+
     # ========== Marker Configuration (Academic PDFs) ==========
     MARKER_OUTPUT_FORMAT = "markdown"
     MARKER_USE_LLM = True
@@ -84,9 +79,9 @@ class Config:
     MARKER_TIMEOUT = 120  # seconds
     
     # ========== Vision Model Configuration (Image Captioning) ==========
-    VISION_MODEL_PROVIDER = os.getenv("VISION_MODEL_PROVIDER", "gemini")  # gemini, openai, ollama
-    VISION_MODEL_NAME = "gemini-2.0-flash-exp"
+    # the vision model comes from the project's processing config
     VISION_CONTEXT_WINDOW = 300  # characters before/after image for context
+    # Marker's own LLM step still reads this from .env (moves to the project's vision credential later)
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     
     # ========== Academic Chunking Configuration ==========

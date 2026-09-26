@@ -8,11 +8,10 @@ from web_api.data_models.enums import ModelProvider, ModelStage
 
 
 class StageModelConfig(BaseModel):
-    """One stage's assignment: which global credential + which model."""
+    """One stage's assignment: which global credential + which model.
+    The embedding size is measured with a test call when saved, never typed."""
     credential_id: uuid.UUID
     model_name:    str = Field(min_length=1, max_length=200)
-    base_url:      Optional[str] = None     # overrides the credential's base_url (Ollama / self-hosted)
-    embedding_dim: Optional[int] = Field(default=None, gt=0)   # embedder stage only
 
 
 class SetModelConfigRequest(BaseModel):
@@ -25,7 +24,6 @@ class StageModelResponse(BaseModel):
     credential_name: str
     provider:        ModelProvider
     model_name:      str
-    base_url:        Optional[str]
     embedding_dim:   Optional[int]
     updated_at:      datetime
 
@@ -37,9 +35,10 @@ class ModelConfigResponse(BaseModel):
 
 
 class StageValidationResult(BaseModel):
-    stage: ModelStage
-    ok:    bool
-    error: Optional[str] = None
+    stage:         ModelStage
+    ok:            bool
+    embedding_dim: Optional[int] = None
+    error:         Optional[str] = None
 
 
 class ValidateModelConfigResponse(BaseModel):

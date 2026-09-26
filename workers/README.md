@@ -29,8 +29,11 @@ workers\.venv\Scripts\celery.exe -A workers.celery_app worker --loglevel=info --
 
 ## Env (shared root `.env`)
 `INTERNAL_API_TOKEN` (must match web_api), `WEB_API_URL`, `QDRANT_URL`, `CELERY_BROKER_URL`,
-plus fallback `OPENAI_API_KEY` / `GEMINI_API_KEY` (used only when a project has no stage config).
+plus `GEMINI_API_KEY` for Marker's own LLM step (academic PDFs).
 Loaded automatically from the repo-root `.env`.
+
+Models and provider keys are **not** in `.env`: once per task the worker fetches them from
+`GET /internal/projects/{id}/processing-config` and calls every provider through LiteLLM.
 
 ## Notes
 - First academic PDF run is slow — Marker downloads models once, then caches.

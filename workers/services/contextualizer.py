@@ -4,9 +4,9 @@ Service for contextualizing chunks using LLM.
 
 import asyncio
 from typing import List
-from openai import AsyncOpenAI
+import litellm
 from workers.models import (
- ContextualOutput,ContextChunk, ChildChunk, ContextualizedChildChunk
+ ContextualOutput,ContextChunk, ChildChunk, ContextualizedChildChunk, ModelEndpoint
 )
 from workers.config import Config
 import tiktoken
@@ -14,16 +14,23 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+litellm.drop_params = True   # drop params a provider doesn't support (e.g. temperature on some models)
+
+
+def parse_contextual_output(content: str) -> ContextualOutput:
+    """Validate the model's JSON answer. Tolerates ```json fences and text around the object."""
+    text = (content or "").strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end < start:
+        raise ValueError(f"No JSON object in model output: {text[:200]!r}")
+    return ContextualOutput.model_validate_json(text[start:end + 1])
+
 
 class Contextualizer:
 
-    def __init__(self, api_key: str = None, model: str = None, base_url: str = None):
-        resolved_key = api_key or Config.OPENAI_API_KEY
-        self.client = AsyncOpenAI(
-            api_key=resolved_key,
-            **({"base_url": base_url} if base_url else {})
-        )
-        self.model = model or Config.LLM_MODEL
+    def __init__(self, llm: ModelEndpoint):
+        self.llm = llm
+        self.model = llm.model
         self.temperature = Config.LLM_TEMPERATURE
         self.max_concurrent = Config.LLM_MAX_CONCURRENT_CALLS
         self.max_context_tokens = Config.LLM_MAX_CONTEXT_TOKENS
@@ -161,12 +168,15 @@ class Contextualizer:
         async with self.semaphore:
             logger.info(f"Sending {len(children)} chunks for contextualization (Context {context_id})")
             
-            response = await self.client.beta.chat.completions.parse(
+            # strict JSON schema where the model supports it; otherwise the prompt asks for JSON
+            # and parse_contextual_output validates it (a bad answer raises -> batch retry)
+            extra = {"response_format": ContextualOutput} if self.llm.supports_json_schema else {}
+            response = await litellm.acompletion(
                 model=self.model,
                 messages=[
                     {
                         "role": "system",
-                        "content": "You generate concise context descriptions for text chunks."
+                        "content": "You generate concise context descriptions for text chunks. Answer only with JSON."
                     },
                     {
                         "role": "user",
@@ -174,10 +184,11 @@ class Contextualizer:
                     }
                 ],
                 temperature=self.temperature,
-                response_format=ContextualOutput
+                **extra,
+                **self.llm.call_kwargs(),
             )
-            
-            result = response.choices[0].message.parsed
+
+        result = parse_contextual_output(response.choices[0].message.content)
         
         if len(result.contextual_chunks) != len(children):
             logger.warning(
@@ -243,7 +254,8 @@ For each child chunk, generate a concise context description ({Config.CONTEXT_DE
 - Relates it to the parent context
 
 IMPORTANT: Return ONLY the context descriptions, NOT the original chunk text.
-Output a JSON object with "contextual_chunks" array containing the descriptions in the same order.
+Output a JSON object with "contextual_chunks" array containing the descriptions in the same order,
+exactly one per chunk, like: {{"contextual_chunks": ["description of chunk 1", "description of chunk 2"]}}
 Each description will be prepended to the original chunk text for better retrieval."""
         
         return prompt

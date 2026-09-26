@@ -66,3 +66,17 @@ class ModelStage(str, Enum):
     EMBEDDER           = "embedder"
     RERANKER           = "reranker"
     VISION             = "vision"      # image captioning + Marker LLM
+
+
+class ModelCapability(str, Enum):
+    """What a model can do. Each stage needs exactly one (see providers.STAGE_CAPABILITY)."""
+    CHAT      = "chat"
+    EMBEDDING = "embedding"
+    RERANK    = "rerank"
+    VISION    = "vision"
+
+
+class RegisteredModelStatus(str, Enum):
+    UNTESTED = "untested"
+    OK       = "ok"
+    FAILED   = "failed"

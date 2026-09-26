@@ -10,6 +10,9 @@ from pathlib import Path
 
 import pytest
 
+# LiteLLM: use the model catalog bundled with the package (no download at import)
+os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+
 # Point the app at the test DB *before* anything imports settings/engine.
 from web_api.core.config import Settings, get_settings
 
@@ -23,13 +26,16 @@ get_settings.cache_clear()
 import httpx  # noqa: E402
 from sqlalchemy import text  # noqa: E402
 
-from web_api.data_models.enums import AppRole  # noqa: E402
+from web_api.data_models.enums import AppRole, ModelCapability  # noqa: E402
 from web_api.db.session import get_sessionmaker  # noqa: E402
+from web_api.errors import ModelTestFailed  # noqa: E402
 from web_api.main import app  # noqa: E402
 from web_api.routers import InternalRouter as internal_module  # noqa: E402
 from web_api.services import ExtractionService as extraction_module  # noqa: E402
 from web_api.services import FileHandlerService as file_module  # noqa: E402
 from web_api.services import ProcessingService as processing_module  # noqa: E402
+from web_api.services import llm_gateway  # noqa: E402
+from web_api.services.llm_gateway import ProbeResult  # noqa: E402
 from web_api.tests.helpers import create_user, login  # noqa: E402
 
 WEB_API_DIR = Path(__file__).resolve().parents[1]
@@ -96,6 +102,41 @@ class FakeCelery:
         self.sent.append({"name": name, "payload": args[0], "task_id": task_id})
 
 
+class FakeQdrant:
+    def __init__(self):
+        self.dropped_projects: list = []
+        self.dropped_documents: list = []
+
+    async def drop_project(self, project_id):
+        self.dropped_projects.append(project_id)
+
+    async def drop_document(self, project_id, document_id):
+        self.dropped_documents.append((project_id, document_id))
+
+
+class FakeGateway:
+    """Stands in for every real provider call in llm_gateway. The catalog itself stays real."""
+
+    def __init__(self):
+        self.probes: list[tuple] = []          # (provider, model_name, capability)
+        self.fail: dict[str, str] = {}         # model_name -> provider error message
+        self.embedding_dim = 3072
+        self.live: set[str] | None = None      # live model list; None = provider unreachable
+        self.ollama: list = []                 # list[llm_gateway.ModelInfo]
+
+    async def probe(self, connection, model_name, capability):
+        self.probes.append((connection.provider, model_name, capability))
+        if model_name in self.fail:
+            raise ModelTestFailed(f"{model_name} ({capability.value}): {self.fail[model_name]}")
+        return ProbeResult(embedding_dim=self.embedding_dim if capability == ModelCapability.EMBEDDING else None)
+
+    async def live_model_names(self, connection, use_cache=True):
+        return self.live
+
+    async def ollama_models(self, connection):
+        return self.ollama
+
+
 @pytest.fixture(scope="session")
 async def app_client():
     async with app.router.lifespan_context(app):
@@ -124,6 +165,21 @@ def minio(monkeypatch):
 def celery(monkeypatch):
     fake = FakeCelery()
     monkeypatch.setattr(processing_module, "get_celery", lambda: fake)
+    return fake
+
+
+@pytest.fixture(autouse=True)
+def qdrant(monkeypatch):
+    fake = FakeQdrant()
+    monkeypatch.setattr(file_module, "qdrant_service", fake)
+    return fake
+
+
+@pytest.fixture(autouse=True)
+def gateway(monkeypatch):
+    fake = FakeGateway()
+    for name in ("probe", "live_model_names", "ollama_models"):
+        monkeypatch.setattr(llm_gateway, name, getattr(fake, name))
     return fake
 
 

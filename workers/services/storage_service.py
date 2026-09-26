@@ -19,23 +19,28 @@ logger = logging.getLogger(__name__)
 
 
 class StorageService:
-    
-    def __init__(self):
+    """One Qdrant collection per project; name and vector size come from web_api's processing config."""
+
+    def __init__(self, collection_name: str, embedding_dimension: int):
         self.client = QdrantClient(url=Config.QDRANT_URL)
-        self.fiction_collection = Config.QDRANT_COLLECTION_FICTION
-        self.academic_collection = Config.QDRANT_COLLECTION_ACADEMIC
-        self.embedding_dimension = Config.EMBEDDING_DIMENSION
-        
-        logger.info(f"Initialized storage service, Qdrant URL: {Config.QDRANT_URL}")
-    
+        self.collection_name = collection_name
+        self.embedding_dimension = embedding_dimension
+
+        logger.info(f"Initialized storage service, Qdrant URL: {Config.QDRANT_URL}, collection: {collection_name}")
+
     async def ensure_collection_exists(self, collection_name: str):
 
         try:
-            # Check if collection exists
-            collections = self.client.get_collections().collections
-            exists = any(c.name == collection_name for c in collections)
-            
-            if not exists:
+            exists = self.client.collection_exists(collection_name)
+
+            if exists:
+                dense = self.client.get_collection(collection_name).config.params.vectors["dense"]
+                if dense.size != self.embedding_dimension:
+                    raise ValueError(
+                        f"Collection {collection_name} holds {dense.size}-dim vectors, "
+                        f"but the embedder makes {self.embedding_dimension}-dim vectors"
+                    )
+            else:
                 logger.info(f"Creating Qdrant collection: {collection_name}")
                 
                 self.client.create_collection(
@@ -57,9 +62,7 @@ class StorageService:
                 )
                 
                 logger.info(f"Created collection {collection_name}")
-            else:
-                logger.info(f"Collection {collection_name} already exists")
-                
+
         except Exception as e:
             logger.error(f"Failed to ensure collection exists: {str(e)}")
             raise
@@ -74,12 +77,9 @@ class StorageService:
         book_metadata: dict = None,
         data_category: str = "fiction"
     ) -> List[str]:
-        
-        collection_name = (
-            self.fiction_collection if data_category == "fiction"
-            else self.academic_collection
-        )
- 
+
+        collection_name = self.collection_name
+
         await self.ensure_collection_exists(collection_name)
 
         if not (len(chunks) == len(dense_vectors) == len(sparse_vectors)):
@@ -104,6 +104,7 @@ class StorageService:
                 "combined_text": chunk.combined_text,
                 "document_id": document_id,
                 "project_id": project_id,
+                "data_category": data_category,
                 "chunk_index": chunk.index,
                 "parent_context_id": chunk.parent_context_id,
                 "start_index": chunk.start_index,
@@ -140,17 +141,12 @@ class StorageService:
         
         return point_ids
     
-    async def delete_document_chunks(
-        self,
-        document_id: str,
-        data_category: str = "fiction"
-    ):
-        
-        collection_name = (
-            self.fiction_collection if data_category == "fiction"
-            else self.academic_collection
-        )
-        
+    async def delete_document_chunks(self, document_id: str):
+
+        collection_name = self.collection_name
+        if not self.client.collection_exists(collection_name):
+            return
+
         self.client.delete(
             collection_name=collection_name,
             points_selector={

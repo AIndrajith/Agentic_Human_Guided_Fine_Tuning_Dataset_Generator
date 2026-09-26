@@ -79,7 +79,9 @@ All settings live in the repo-root `.env`, which both services read. `.env.examp
 - **Two database roles:** `DATABASE_URL` uses `synth_app`, which can only read and write data. `MIGRATION_DATABASE_URL` uses `synth_owner`, for Alembic and checkpointer setup.
 - **`INTERNAL_API_TOKEN`:** must be the same for the API and the workers.
 - **Email:** if `RESEND_API_KEY` or `FROM_EMAIL` is unset, invite links are written to the API log instead of being emailed.
-- **LLM provider keys** are not environment variables. Admins add them in the app (Credentials); `OPENAI_API_KEY` / `GEMINI_API_KEY` are only worker fallbacks.
+- **LLM provider keys** are not environment variables. Admins add them in the app (Credentials); the worker fetches them per job from web_api. Only Marker (academic PDFs) still reads `GEMINI_API_KEY` from `.env`.
+- **LiteLLM** (both services) downloads its newest model catalog at startup. Set `LITELLM_LOCAL_MODEL_COST_MAP=True` to use the copy bundled with the package (offline; tests do this). The version is pinned in both `pyproject.toml` files; upgrade it on purpose.
+- **Qdrant:** one collection per project (`project_<id>`), created by the worker. `QDRANT_URL` is used by the worker and by web_api (to delete collections).
 
 ## 5. Troubleshooting
 

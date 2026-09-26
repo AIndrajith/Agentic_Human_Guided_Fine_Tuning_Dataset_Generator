@@ -1,5 +1,5 @@
 
-from workers.models import TaskDocument, TaskCredentials
+from workers.models import TaskDocument, ProcessingConfig
 from workers.services.file_fetcher import FileFetcherService
 from workers.services.text_extractor import TextExtractorService
 from workers.services.chunking_service_fiction import ChunkingService
@@ -24,7 +24,6 @@ class FictionProcessor:
         self.text_extractor = TextExtractorService()
         self.chunking_service = ChunkingService()
         self.bm25_service = BM25Service()
-        self.storage_service = StorageService()
         self.extracted_storage = ExtractedContentStorageService()
         self.temp_file_manager = TempFileManager()
         self.webhook_notifier = WebhookNotifier()
@@ -34,18 +33,11 @@ class FictionProcessor:
         task_id: str,
         document: TaskDocument,
         project_id: str,
-        credentials: Optional[TaskCredentials] = None,
+        config: ProcessingConfig,
     ) -> dict:
-        self.contextualizer = Contextualizer(
-            api_key=credentials.llm_api_key if credentials else None,
-            model=credentials.llm_model if credentials else None,
-            base_url=credentials.llm_base_url if credentials else None,
-        )
-        self.embedding_service = EmbeddingService(
-            api_key=credentials.embed_api_key if credentials else None,
-            model=credentials.embed_model if credentials else None,
-            base_url=credentials.embed_base_url if credentials else None,
-        )
+        self.contextualizer = Contextualizer(config.llm)
+        self.embedding_service = EmbeddingService(config.embedder)
+        self.storage_service = StorageService(config.qdrant_collection, config.embedder.dimension)
 
         document_id = document.id
         current_stage = ProcessingStage.FETCHING_FILES

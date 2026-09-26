@@ -4,7 +4,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from web_api.data_models.CredentialModels import (
-    PROVIDER_CREDENTIAL_SCHEMA,
     CreateCredentialRequest,
     CredentialProjectRef,
     CredentialResponse,
@@ -14,27 +13,51 @@ from web_api.data_models.enums import ModelProvider
 from web_api.db.models import Project, ProjectStageModel, ProviderCredential, User
 from web_api.errors import ConflictError, CredentialInUse, CredentialNotFound, ValidationError
 from web_api.services.encryption_service import EncryptionService
+from web_api.services.llm_gateway import Connection
+from web_api.services.providers import get_spec
+
+_URL_SETTINGS = ("base_url", "endpoint")
 
 
 class CredentialService:
-    """Global provider credentials: every admin can see and manage all of them."""
+    """Global provider connections: every admin can see and manage all of them."""
 
     def __init__(self, session: AsyncSession):
         self.session = session
 
     @staticmethod
-    def _validate_fields(provider: ModelProvider, fields: dict[str, str]) -> dict[str, str]:
-        allowed = PROVIDER_CREDENTIAL_SCHEMA.get(provider, [])
-        cleaned = {k: v.strip() for k, v in fields.items()}
-        missing = [f for f in allowed if not cleaned.get(f)]
-        unknown = [f for f in cleaned if f not in allowed]
+    def _check_fields(
+        provider: ModelProvider, kind: str, values: dict[str, str], required: tuple[str, ...], optional: tuple[str, ...]
+    ) -> dict[str, str]:
+        cleaned = {k: v.strip() for k, v in values.items() if v and v.strip()}
+        missing = [f for f in required if not cleaned.get(f)]
+        unknown = [f for f in cleaned if f not in required + optional]
         if missing or unknown:
             problems = []
             if missing:
                 problems.append(f"missing {missing}")
             if unknown:
                 problems.append(f"unknown {unknown}")
-            raise ValidationError(f"Invalid fields for {provider.value}: {'; '.join(problems)}. Expected {allowed}")
+            raise ValidationError(
+                f"Invalid {kind} for {provider.value}: {'; '.join(problems)}. Expected {list(required + optional)}"
+            )
+        return cleaned
+
+    @classmethod
+    def _validate_secrets(cls, provider: ModelProvider, secrets: dict[str, str]) -> dict[str, str]:
+        spec = get_spec(provider)
+        return cls._check_fields(provider, "secrets", secrets, spec.secret_fields, spec.optional_secret_fields)
+
+    @classmethod
+    def _validate_settings(cls, provider: ModelProvider, settings: dict[str, str]) -> dict[str, str]:
+        spec = get_spec(provider)
+        merged = {**spec.default_settings, **{k: v for k, v in settings.items() if v and v.strip()}}
+        cleaned = cls._check_fields(provider, "settings", merged, spec.settings_fields, ())
+        for name in _URL_SETTINGS:
+            if name in cleaned:
+                if not cleaned[name].startswith(("http://", "https://")):
+                    raise ValidationError(f"'{name}' must start with http:// or https://")
+                cleaned[name] = cleaned[name].rstrip("/")
         return cleaned
 
     @staticmethod
@@ -42,7 +65,7 @@ class CredentialService:
         enc = EncryptionService.get()
         return {k: enc.encrypt(v) for k, v in fields.items()}
 
-    async def _get(self, credential_id: uuid.UUID) -> ProviderCredential:
+    async def get(self, credential_id: uuid.UUID) -> ProviderCredential:
         credential = await self.session.get(ProviderCredential, credential_id)
         if not credential:
             raise CredentialNotFound()
@@ -75,7 +98,8 @@ class CredentialService:
             id=credential.id,
             name=credential.name,
             provider=credential.provider,
-            fields_present=sorted(credential.encrypted_fields),
+            secrets_present=sorted(credential.encrypted_fields),
+            settings=credential.settings,
             used_by_projects=used_by,
             created_by=credential.created_by,
             created_at=credential.created_at,
@@ -95,16 +119,16 @@ class CredentialService:
         ))
 
     async def get_credential(self, credential_id: uuid.UUID) -> CredentialResponse:
-        return await self._to_response(await self._get(credential_id))
+        return await self._to_response(await self.get(credential_id))
 
     async def create_credential(self, request: CreateCredentialRequest, admin: User) -> CredentialResponse:
         name = request.name.strip()
         await self._ensure_name_free(name)
-        fields = self._validate_fields(request.provider, request.fields)
         credential = ProviderCredential(
             name=name,
             provider=request.provider,
-            encrypted_fields=self._encrypt(fields),
+            encrypted_fields=self._encrypt(self._validate_secrets(request.provider, request.secrets)),
+            settings=self._validate_settings(request.provider, request.settings),
             created_by=admin.id,
         )
         self.session.add(credential)
@@ -112,18 +136,20 @@ class CredentialService:
         return self._response(credential, [])
 
     async def update_credential(self, credential_id: uuid.UUID, request: UpdateCredentialRequest) -> CredentialResponse:
-        credential = await self._get(credential_id)
+        credential = await self.get(credential_id)
         if request.name is not None:
             name = request.name.strip()
             await self._ensure_name_free(name, exclude_id=credential.id)
             credential.name = name
-        if request.fields is not None:
-            credential.encrypted_fields = self._encrypt(self._validate_fields(credential.provider, request.fields))
+        if request.secrets is not None:
+            credential.encrypted_fields = self._encrypt(self._validate_secrets(credential.provider, request.secrets))
+        if request.settings is not None:
+            credential.settings = self._validate_settings(credential.provider, request.settings)
         await self.session.commit()
         return await self._to_response(credential)
 
     async def delete_credential(self, credential_id: uuid.UUID) -> None:
-        credential = await self._get(credential_id)
+        credential = await self.get(credential_id)
         used_by = (await self._usage([credential.id]))[credential.id]
         if used_by:
             titles = ", ".join(p.title for p in used_by)
@@ -131,7 +157,15 @@ class CredentialService:
         await self.session.delete(credential)
         await self.session.commit()
 
-    async def get_decrypted_fields(self, credential_id: uuid.UUID) -> tuple[ModelProvider, dict[str, str]]:
-        credential = await self._get(credential_id)
+    @staticmethod
+    def connection_for(credential: ProviderCredential) -> Connection:
+        """Decrypted secrets + settings, ready for LLM calls. Never return this to a client."""
         enc = EncryptionService.get()
-        return credential.provider, {k: enc.decrypt(v) for k, v in credential.encrypted_fields.items()}
+        return Connection(
+            provider=credential.provider,
+            secrets={k: enc.decrypt(v) for k, v in credential.encrypted_fields.items()},
+            settings=dict(credential.settings),
+        )
+
+    async def get_connection(self, credential_id: uuid.UUID) -> Connection:
+        return self.connection_for(await self.get(credential_id))

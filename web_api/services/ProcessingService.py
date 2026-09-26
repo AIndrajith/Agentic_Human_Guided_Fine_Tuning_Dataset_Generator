@@ -7,15 +7,22 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from web_api.core.celery_client import PROCESS_DOCUMENTS_TASK, get_celery
-from web_api.data_models.enums import DocumentStatus, FileType, JobStatus, ModelStage
+from web_api.data_models.enums import Datatype, DocumentStatus, FileType, JobStatus, ModelProvider, ModelStage
 from web_api.data_models.ProcessingModels import (
     ChunkCompletionData,
     JobDocumentResponse,
     JobResponse,
+    WorkerEmbedderEndpoint,
+    WorkerModelEndpoint,
+    WorkerProcessingConfig,
 )
 from web_api.db.models import Chunk, Document, JobDocument, ProcessingJob, Project, ProjectStageModel, User
-from web_api.errors import ConflictError, DocumentNotFound, JobNotFound, ValidationError
+from web_api.errors import ConflictError, DocumentNotFound, JobNotFound, ProjectNotFound, ValidationError
+from web_api.services import llm_gateway
 from web_api.services.credential_service import CredentialService
+from web_api.services.ModelCatalogService import ModelCatalogService
+from web_api.services.providers import STAGE_CAPABILITY
+from web_api.services.QdrantService import collection_name
 
 logger = logging.getLogger(__name__)
 
@@ -30,35 +37,65 @@ class ProcessingService:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    # ---------- start ----------
+    # ---------- worker config ----------
 
-    async def _resolve_credentials(self, project_id: uuid.UUID) -> dict:
-        """Map the project's stage config to the worker's TaskCredentials shape.
-        Stages that aren't configured are omitted; workers then fall back to their env."""
-        rows = {
+    @staticmethod
+    def _required_stages(project: Project) -> list[ModelStage]:
+        stages = [ModelStage.META_AGENT, ModelStage.EMBEDDER]
+        if project.data_type == Datatype.ACADEMIC:
+            stages.append(ModelStage.VISION)
+        return stages
+
+    async def _stage_rows(self, project_id: uuid.UUID) -> dict[ModelStage, ProjectStageModel]:
+        return {
             sm.stage: sm for sm in await self.session.scalars(
                 select(ProjectStageModel).where(ProjectStageModel.project_id == project_id)
             )
         }
-        credentials_service = CredentialService(self.session)
-        creds: dict[str, str | None] = {}
 
-        if meta := rows.get(ModelStage.META_AGENT):
-            provider, fields = await credentials_service.get_decrypted_fields(meta.credential_id)
-            creds |= {
-                "llm_provider": provider.value, "llm_model": meta.model_name,
-                "llm_api_key": fields.get("api_key"), "llm_base_url": meta.base_url or fields.get("base_url"),
-            }
-        if embed := rows.get(ModelStage.EMBEDDER):
-            provider, fields = await credentials_service.get_decrypted_fields(embed.credential_id)
-            creds |= {
-                "embed_provider": provider.value, "embed_model": embed.model_name,
-                "embed_api_key": fields.get("api_key"), "embed_base_url": embed.base_url or fields.get("base_url"),
-            }
-        if vision := rows.get(ModelStage.VISION):
-            _, fields = await credentials_service.get_decrypted_fields(vision.credential_id)
-            creds |= {"vision_api_key": fields.get("api_key"), "vision_model": vision.model_name}
-        return creds
+    async def _ensure_configured(self, project: Project) -> dict[ModelStage, ProjectStageModel]:
+        rows = await self._stage_rows(project.id)
+        if missing := [s.value for s in self._required_stages(project) if s not in rows]:
+            raise ValidationError(f"Configure these model steps first: {', '.join(missing)}")
+        return rows
+
+    async def _endpoint(self, stage_model: ProjectStageModel) -> dict:
+        credential = await CredentialService(self.session).get(stage_model.credential_id)
+        connection = CredentialService.connection_for(credential)
+        capability = STAGE_CAPABILITY[stage_model.stage]
+
+        info = llm_gateway.catalog_lookup(credential.provider, stage_model.model_name)
+        if credential.provider == ModelProvider.AZURE_OPENAI:   # deployment name -> look up its base model
+            registered = await ModelCatalogService(self.session).find_registered(credential.id, stage_model.model_name)
+            if registered and registered.base_model:
+                info = llm_gateway.catalog_lookup(credential.provider, registered.base_model)
+        return {
+            "model": connection.model_id(stage_model.model_name, capability),
+            **connection.litellm_kwargs(),
+            "context_window": info.context_window if info else None,
+            "supports_json_schema": info.supports_json_schema if info else False,
+        }
+
+    async def build_worker_config(self, project_id: uuid.UUID) -> WorkerProcessingConfig:
+        """Keys + models the worker needs, fetched just in time (never sent through Redis)."""
+        project = await self.session.get(Project, project_id)
+        if not project:
+            raise ProjectNotFound()
+        rows = await self._ensure_configured(project)
+        embedder = rows[ModelStage.EMBEDDER]
+        if not embedder.embedding_dim:
+            raise ValidationError("The embedder has no measured vector size. Save the embedder step again.")
+        vision = rows.get(ModelStage.VISION)
+        return WorkerProcessingConfig(
+            project_id=project.id,
+            data_type=project.data_type,
+            qdrant_collection=collection_name(project.id),
+            llm=WorkerModelEndpoint(**await self._endpoint(rows[ModelStage.META_AGENT])),
+            embedder=WorkerEmbedderEndpoint(**await self._endpoint(embedder), dimension=embedder.embedding_dim),
+            vision=WorkerModelEndpoint(**await self._endpoint(vision)) if vision else None,
+        )
+
+    # ---------- start ----------
 
     async def start_job(self, project: Project, document_ids: list[uuid.UUID] | None, user: User) -> JobResponse:
         query = select(Document).where(Document.project_id == project.id)
@@ -81,9 +118,9 @@ class ProcessingService:
         if images := [d.original_name for d in documents if d.file_type != FileType.PDF]:
             raise ValidationError(f"Only PDFs can be processed for now: {', '.join(images)}")
 
-        credentials = await self._resolve_credentials(project.id)
+        await self._ensure_configured(project)
 
-        job = ProcessingJob(id=uuid.uuid4(), project_id=project.id, requested_by=user.id)
+        job =ProcessingJob(id=uuid.uuid4(), project_id=project.id, requested_by=user.id)
         job.celery_task_id = str(job.id)
         self.session.add(job)
         await self.session.flush()
@@ -98,7 +135,7 @@ class ProcessingService:
             "project_id": str(project.id),
             "documents": [{"id": str(d.id), "file_size": d.size_bytes} for d in documents],
             "data_type": project.data_type.value,
-            "credentials": credentials,
+            # no keys here: the worker fetches them from /internal/projects/{id}/processing-config
         }
         try:
             # kombu publishing is blocking I/O

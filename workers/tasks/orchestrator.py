@@ -2,10 +2,12 @@
 import asyncio
 from celery import Task
 from workers.celery_app import celery_app
-from workers.models import TaskData, TaskCredentials
+from workers.models import TaskData
+from workers.services.processing_config import ProcessingConfigError, fetch_processing_config
 from workers.tasks.fiction_processor import FictionProcessor
 from workers.tasks.academic_processor import AcademicProcessor
-from workers.enums import DataCategory
+from workers.utils.webhook_notifier import WebhookNotifier
+from workers.enums import DataCategory, ProcessingStage
 import logging
 
 logger = logging.getLogger(__name__)
@@ -66,17 +68,31 @@ async def _process_documents_async(task: Task, task_data: TaskData):
     else:
         raise ValueError(f"Unknown data type: {task_data.data_type}")
 
+    # Models + keys come from web_api, once per task (they never travel through Redis)
+    try:
+        config = await fetch_processing_config(task_data.project_id)
+    except ProcessingConfigError as e:
+        # e.g. a model step isn't configured: retrying won't help, so fail every document now
+        logger.error(f"Task {task_data.task_id}: cannot load processing config: {e}")
+        notifier = WebhookNotifier()
+        for doc in task_data.documents:
+            await notifier.notify_processing_failed(
+                task_id=task_data.task_id, document_id=doc.id,
+                error_message=str(e), stage=ProcessingStage.LOADING_CONFIG.value,
+            )
+        return {"task_id": task_data.task_id, "total_documents": len(task_data.documents),
+                "successful": 0, "failed": len(task_data.documents), "error": str(e)}
+
     # Process each document
     for doc in task_data.documents:
         try:
             logger.info(f"Processing document: {doc.id}")
 
-            creds = task_data.credentials  # already parsed into TaskCredentials by TaskData
             result = await processor.process_document(
                 task_id=task_data.task_id,
                 document=doc,
                 project_id=task_data.project_id,
-                credentials=creds,
+                config=config,
             )
 
             results.append({

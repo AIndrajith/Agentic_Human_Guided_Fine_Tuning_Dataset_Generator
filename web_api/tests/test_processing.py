@@ -3,16 +3,18 @@ import uuid
 from sqlalchemy import text
 
 from web_api.db.session import get_sessionmaker
-from web_api.tests.helpers import create_user, login
+from web_api.tests.helpers import API_KEY, configure_stages, create_user, login
 
 PDF = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n%%EOF"
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 
 
-async def _project_with_docs(client, headers, *files, data_type="fiction"):
+async def _project_with_docs(client, headers, *files, data_type="fiction", configured=True):
     pid = (await client.post("/projects", json={"title": "P", "data_type": data_type}, headers=headers)).json()["id"]
     r = await client.post(f"/projects/{pid}/documents", files=[("files", f) for f in files], headers=headers)
     assert r.status_code == 201, r.text
+    if configured:
+        await configure_stages(pid, academic=data_type == "academic")
     return pid, [d["id"] for d in r.json()]
 
 
@@ -165,16 +167,34 @@ async def test_processing_access_and_validation(app_client, user_headers, minio,
     assert celery.sent[0]["payload"]["documents"] == [{"id": pdf, "file_size": len(PDF)}]
 
 
-async def test_stage_credentials_forwarded_to_worker(app_client, admin_headers, user_headers, minio, celery):
-    cred = (await app_client.post("/credentials", headers=admin_headers, json={
-        "name": "OpenAI", "provider": "openai", "fields": {"api_key": "sk-abc"},
-    })).json()
+async def test_model_steps_required_before_processing(app_client, user_headers, minio, celery):
+    pid, _ = await _project_with_docs(app_client, user_headers, ("a.pdf", PDF, "application/pdf"), configured=False)
+    r = await app_client.post(f"/projects/{pid}/processing-jobs", headers=user_headers)
+    assert r.status_code == 422 and "meta_agent, embedder" in r.json()["error"]["message"]
+    assert celery.sent == []
+
+
+async def test_keys_fetched_by_worker_not_sent_through_redis(app_client, user_headers, minio, celery, internal_headers):
     pid, _ = await _project_with_docs(app_client, user_headers, ("a.pdf", PDF, "application/pdf"))
-    await app_client.put(f"/projects/{pid}/model-config", headers=user_headers, json={"stages": {
-        "meta_agent": {"credential_id": cred["id"], "model_name": "gpt-4o-mini"},
-        "embedder": {"credential_id": cred["id"], "model_name": "text-embedding-3-large", "embedding_dim": 3072},
-    }})
     await app_client.post(f"/projects/{pid}/processing-jobs", headers=user_headers)
-    creds = celery.sent[0]["payload"]["credentials"]
-    assert creds["llm_model"] == "gpt-4o-mini" and creds["llm_api_key"] == "sk-abc"
-    assert creds["embed_model"] == "text-embedding-3-large" and creds["embed_provider"] == "openai"
+    payload = celery.sent[0]["payload"]
+    assert "credentials" not in payload and API_KEY not in str(payload)
+
+    url = f"/internal/projects/{pid}/processing-config"
+    assert (await app_client.get(url)).status_code == 401
+    config = (await app_client.get(url, headers=internal_headers)).json()
+    assert config["qdrant_collection"] == f"project_{uuid.UUID(pid).hex}"
+    assert config["llm"]["model"] == "openai/gpt-4o-mini" and config["llm"]["api_key"] == API_KEY
+    assert config["llm"]["supports_json_schema"] is True and config["llm"]["context_window"] == 128000
+    assert config["embedder"]["model"] == "openai/text-embedding-3-large" and config["embedder"]["dimension"] == 3072
+    assert config["vision"] is None
+
+
+async def test_deleting_removes_vectors(app_client, user_headers, minio, qdrant):
+    pid, (doc_a, doc_b) = await _project_with_docs(
+        app_client, user_headers, ("a.pdf", PDF, "application/pdf"), ("b.pdf", PDF, "application/pdf")
+    )
+    assert (await app_client.delete(f"/documents/{doc_a}", headers=user_headers)).status_code == 204
+    assert qdrant.dropped_documents == [(uuid.UUID(pid), uuid.UUID(doc_a))]
+    assert (await app_client.delete(f"/projects/{pid}", headers=user_headers)).status_code == 204
+    assert qdrant.dropped_projects == [uuid.UUID(pid)]

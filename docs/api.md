@@ -84,8 +84,8 @@ There are two kinds of roles:
 | Action | Who |
 |---|---|
 | Invite users, list users, (de)activate users | admin |
-| Manage credentials (API keys) | admin |
-| See credential names (to pick one) | anyone logged in |
+| Manage credentials (connections), test them, register Ollama / Azure models | admin |
+| See credential names and their model dropdown (to pick one) | anyone logged in |
 | Create a project | anyone logged in |
 | View a project, its members, documents, model config, jobs, extractions | project member |
 | Upload / delete documents, start processing | project member (owner or worker) |
@@ -116,9 +116,9 @@ The user gets an email with a link: `{HOST_URL}/setup-password?token=...`
 
 **Step 6 — upload PDFs** → [`POST /projects/{project_id}/documents`](#post-projectsproject_iddocuments)
 
-**Step 7 — admin adds an API key** → [`POST /credentials`](#post-credentials) (e.g. an OpenAI key, named "OpenAI team key")
+**Step 7 — admin adds a connection** → [`POST /credentials`](#post-credentials) (e.g. an OpenAI key, named "OpenAI team key"). For Ollama / Azure, also register the models on the connection ([5.5](#55-credentials-connections)).
 
-**Step 8 — owner chooses models for the project** → [`PUT /projects/{project_id}/model-config`](#put-projectsproject_idmodel-config). At minimum set `meta_agent` (used to write chunk context) and `embedder`. Optional: test first with `/validate`.
+**Step 8 — owner chooses models for the project** → pick a model from [`GET /credentials/{id}/models?stage=...`](#model-dropdown), then save with [`PUT /projects/{project_id}/model-config`](#put-projectsproject_idmodel-config). Required: `meta_agent` (writes chunk context) and `embedder`; academic projects also need `vision`. Each model is test-called when saved.
 
 **Step 9 — start processing** → [`POST /projects/{project_id}/processing-jobs`](#post-projectsproject_idprocessing-jobs). You get a job back with status `queued`.
 
@@ -288,61 +288,98 @@ Errors: `400 unsupported_file_type`, `413 file_too_large`, `422` (no files / emp
 **Member.** List, oldest first.
 
 #### `GET /documents/{document_id}` · `DELETE /documents/{document_id}`
-**Member.** Get one / delete one (`204`, also removes the file from MinIO).
+**Member.** Get one / delete one (`204`, also removes the file from MinIO and its vectors from Qdrant).
 
 ---
 
-### 5.5 Credentials (API keys)
+### 5.5 Credentials (connections)
 
-Credentials are **global**: an admin adds a key once (e.g. "OpenAI team key"), and any project can use it. Keys are encrypted in the database and **never** returned by the API.
+A credential is a **connection to one AI provider**: its secrets (API key) plus plain settings (a URL). Credentials are **global**: an admin adds one once (e.g. "OpenAI team key"), and any project can use it. Secrets are encrypted in the database and **never** returned by the API; settings are shown.
+
+All providers are called through **LiteLLM**, so every provider below works in both the API and the worker.
 
 **Credential** object (admin view):
 ```json
 {
   "id": "uuid",
-  "name": "OpenAI team key",
-  "provider": "openai",
-  "fields_present": ["api_key"],     // names only, never values
+  "name": "Office Ollama",
+  "provider": "ollama",
+  "secrets_present": [],                          // names only, never values
+  "settings": { "base_url": "http://127.0.0.1:11434" },
   "used_by_projects": [ { "project_id": "uuid", "title": "Sherlock Holmes" } ],
   "created_by": "uuid", "created_at": "...", "updated_at": "..."
 }
 ```
 
-**Which fields each provider needs** (`GET /credentials/schema` returns this too):
+**Fields per provider** (`GET /credentials/schema` returns this, so the UI knows which form to show):
 
-| Provider | Fields |
-|---|---|
-| `openai`, `anthropic`, `google`, `groq`, `mistral`, `cohere`, `together`, `openrouter`, `voyageai`, `jina` | `api_key` |
-| `azure_openai` | `api_key`, `endpoint`, `api_version` |
-| `ollama` | `base_url` |
+| Provider | Secrets | Settings | Form | Model list comes from |
+|---|---|---|---|---|
+| `openai`, `anthropic`, `google`, `groq`, `mistral`, `together`, `openrouter` | `api_key` | — | simple | catalog, **checked against the provider** |
+| `cohere`, `voyageai`, `jina` | `api_key` | — | simple | catalog only (no "list models" check) |
+| `ollama` | `api_key` (optional, only behind a proxy) | `base_url` (default `http://127.0.0.1:11434`) | **config page** | models registered on the connection |
+| `azure_openai` | `api_key` | `endpoint`, `api_version` (default `2024-10-21`) | **config page** | deployments registered on the connection |
 
 | Endpoint | Who | Send / get |
 |---|---|---|
-| `GET /credentials/schema` | logged in | `[{ "provider", "required_fields" }]` |
+| `GET /credentials/schema` | logged in | `[{ provider, label, secret_fields, optional_secret_fields, settings_fields, default_settings, model_source, live_listing, config_page }]` |
 | `GET /credentials/options` | logged in | `[{ "id", "name", "provider" }]` — what an owner picks from |
 | `GET /credentials` | admin | list of Credential |
 | `GET /credentials/{credential_id}` | admin | Credential |
-| <a id="post-credentials"></a>`POST /credentials` | admin | `{ "name": "OpenAI team key", "provider": "openai", "fields": { "api_key": "sk-..." } }` → `201` |
-| `PATCH /credentials/{credential_id}` | admin | `{ "name"?: "...", "fields"?: {...} }` — `fields` **replaces all** keys (use it to rotate a key; projects pick it up automatically) |
+| <a id="post-credentials"></a>`POST /credentials` | admin | `{ "name": "OpenAI team key", "provider": "openai", "secrets": { "api_key": "sk-..." }, "settings": {} }` → `201` |
+| `PATCH /credentials/{credential_id}` | admin | `{ "name"?, "secrets"?, "settings"? }` — `secrets` / `settings` each **replace all** values (rotate a key this way; projects pick it up automatically) |
 | `DELETE /credentials/{credential_id}` | admin | `204` |
+| `POST /credentials/{credential_id}/test` | admin | `{ "ok": true, "message": "Connected, 42 models available" }` — `ok: null` means this provider can't be tested without a model |
 
-Errors: `422` missing or unknown fields (message says which), `409` name already used, `409 credential_in_use` on delete (message lists the projects — detach it from them first).
+Errors: `422` missing/unknown fields or a URL without `http(s)://` (message says which), `409` name already used, `409 credential_in_use` on delete (message lists the projects — detach it from them first).
+
+#### <a id="model-dropdown"></a>`GET /credentials/{credential_id}/models?stage=embedder`
+**Logged in.** The model dropdown for one stage (leave out `stage` for all models).
+```json
+{
+  "credential_id": "uuid", "provider": "openai", "stage": "embedder",
+  "source": "catalog",
+  "provider_checked": true,        // confirmed against the provider's live model list
+  "warning": null,                 // e.g. "Couldn't reach the provider, showing known models."
+  "allow_custom": true,            // UI may offer "Other..." (typed name, tested on save)
+  "models": [
+    { "name": "text-embedding-3-large", "capabilities": ["embedding"], "context_window": 8191, "embedding_dim": 3072, "status": null }
+  ]
+}
+```
+- **Catalog providers:** models come from LiteLLM's catalog, then (where possible) are checked against the provider: models the key can't use are removed, brand-new models the catalog doesn't know yet are added with `capabilities: []` (unknown — the test call on save decides). The provider list is cached for 10 minutes.
+- **Ollama / Azure:** the connection's registered models that fit the stage (failed ones are hidden). `allow_custom` is false — register a model first.
+
+#### Registered models (Ollama / Azure configuration page)
+
+**Admin.** Models on a connection whose models can't be looked up: your Ollama downloads, your Azure deployment names.
+
+| Endpoint | Send / get |
+|---|---|
+| `GET /credentials/{id}/registered-models` | list of RegisteredModel |
+| `POST /credentials/{id}/registered-models` | `{ "name": "company-gpt4o", "base_model"?: "gpt-4o", "capabilities"?: ["chat", "vision"] }` → `201`. Tested right away; a failed test is **saved** with `status: "failed"` and the reason |
+| `POST /credentials/{id}/registered-models/sync?test=false` | **Ollama only.** Reads the models downloaded on the server (with their capabilities). Models gone from the server are marked `failed`. `test=true` also test-calls each one (slow: each model loads into memory) |
+| `POST /credentials/{id}/registered-models/{model_id}/test` | re-test → RegisteredModel |
+| `DELETE /credentials/{id}/registered-models/{model_id}` | `204`; `409 model_in_use` while a project uses it |
+
+**RegisteredModel**: `{ id, credential_id, name, base_model, capabilities, embedding_dim, context_window, status (untested|ok|failed), last_error, last_checked_at, created_at }`
+
+- **Azure:** give `base_model` (the real model behind the deployment) and capabilities, context size and embedding size are filled in from the catalog. Otherwise give `capabilities`.
+- **Ollama:** the model must already be on the server (`ollama pull <name>`), or you get a `422` saying so.
 
 ---
 
 ### 5.6 Model config (which model does which job)
 
-A project has **stages** — jobs an AI model does. For each stage you attach a credential + a model name.
+A project has **stages** — jobs an AI model does. For each stage you attach a credential + a model name. Each stage needs one **capability**:
 
-| Stage | What it's for | Allowed providers |
+| Stage | What it's for | Needs |
 |---|---|---|
-| `meta_agent` | writes the context blurb for each chunk (used now) | openai, anthropic, google, groq, mistral, cohere, together, openrouter, azure_openai, ollama |
-| `embedder` | turns text into vectors (used now) | openai, google, ollama, cohere, voyageai, jina |
-| `vision` | describes images in academic papers (used now) | google, openai |
-| `question_generator`, `answer_generator`, `validator` | QA generation (planned) | same as `meta_agent` |
-| `reranker` | reorders search results (planned) | cohere, jina, ollama |
-
-> Today the workers only really support **OpenAI-compatible** providers for `meta_agent` / `embedder`. Other providers are accepted here but may fail in the worker (see [Known gaps](#11-known-gaps)).
+| `meta_agent` | writes the context note for each chunk (**required** to process) | `chat` |
+| `embedder` | turns text into vectors (**required** to process) | `embedding` |
+| `vision` | describes images in academic papers (**required** for academic projects) | `vision` |
+| `question_generator`, `answer_generator`, `validator` | QA generation (planned) | `chat` |
+| `reranker` | reorders search results (planned) | `rerank` |
 
 #### `GET /projects/{project_id}/model-config`
 **Member.**
@@ -353,7 +390,7 @@ A project has **stages** — jobs an AI model does. For each stage you attach a 
   "stages": [
     { "stage": "embedder", "credential_id": "uuid", "credential_name": "OpenAI team key",
       "provider": "openai", "model_name": "text-embedding-3-large",
-      "base_url": null, "embedding_dim": 3072, "updated_at": "..." }
+      "embedding_dim": 3072, "updated_at": "..." }
   ]
 }
 ```
@@ -364,24 +401,27 @@ A project has **stages** — jobs an AI model does. For each stage you attach a 
 {
   "stages": {
     "meta_agent": { "credential_id": "uuid", "model_name": "gpt-4o-mini" },
-    "embedder":   { "credential_id": "uuid", "model_name": "text-embedding-3-large", "embedding_dim": 3072 }
+    "embedder":   { "credential_id": "uuid", "model_name": "text-embedding-3-large" }
   }
 }
 ```
-- `embedding_dim` is **required** for `embedder` and **not allowed** on other stages. It must match the model (e.g. 3072 for `text-embedding-3-large`).
-- `base_url` is optional — overrides the credential's URL (for Ollama / self-hosted).
-- After the first document is processed, the **embedder is locked** (`embedding_locked: true`) because changing it would make old vectors useless.
+What happens for each stage, in order:
+1. The model must fit the stage: a catalog model of the wrong kind (e.g. an embedding model for `meta_agent`) → `422`. Ollama / Azure models must be registered on the connection.
+2. **One tiny real call** with the model (chat: "Reply with OK"; embedding: embed "hello"; vision: a 16×16 image; rerank: two words). Failure → `422 model_test_failed` with the provider's message, and **nothing is saved**.
+3. For `embedder`, the vector size is **measured** from that call and stored as `embedding_dim` — you never type it.
+
+After the first document is processed, the **embedder is locked** (`embedding_locked: true`) because changing it would make old vectors useless.
 
 → the same object as GET.
-Errors: `404 credential_not_found`, `422` provider can't do that stage / `embedding_dim` rule, `409` embedder is locked.
+Errors: `404 credential_not_found`, `422` wrong kind of model / not registered, `422 model_test_failed`, `409` embedder is locked.
 
 #### `DELETE /projects/{project_id}/model-config/{stage}`
 **Owner.** Remove one stage → `204`. (`409` for a locked embedder.)
 
 #### `POST /projects/{project_id}/model-config/validate`
-**Owner.** Same body as PUT. **Saves nothing** — it makes a tiny real call to each provider to prove the key and model name work (costs a fraction of a cent).
+**Owner.** Same body as PUT. **Saves nothing** — runs the same checks and test calls (costs a fraction of a cent).
 ```json
-{ "all_ok": false, "results": [ { "stage": "embedder", "ok": false, "error": "model not found" } ] }
+{ "all_ok": false, "results": [ { "stage": "embedder", "ok": false, "embedding_dim": null, "error": "Stage 'embedder': ... model not found" } ] }
 ```
 
 ---
@@ -410,6 +450,7 @@ Errors: `404 credential_not_found`, `422` provider can't do that stage / `embedd
 ```
 - **No body / no ids** = process every document that is `uploaded` or `failed` (so re-running only retries failures).
 - Only **PDFs** can be processed right now.
+- The project needs its model steps first: `meta_agent` + `embedder` (+ `vision` for academic), else `422`.
 
 → `202` Job (status `queued`).
 Errors: `404 document_not_found` (id not in this project), `409` a document is already queued/processing, `422` nothing to process / not a PDF, `409` "Could not queue the job" (Redis is down — the job is saved as `failed`).
@@ -450,33 +491,44 @@ What actually happens after you call `POST /projects/{project_id}/processing-job
 ```
  1. API     creates a processing_jobs row + one job_documents row per document
             documents.status = "queued"
- 2. API     reads the project's model config, decrypts the keys, and puts a task on Redis
- 3. Worker  picks up the task, then for each document:
+ 2. API     checks the model steps are configured, then puts a task on Redis (IDs only, no keys)
+ 3. Worker  picks up the task
+      GET  /internal/projects/{project_id}/processing-config   → models, keys, vector size, collection
+      (kept in memory only; a 4xx here fails every document of the task with stage "loading_config")
+    then for each document:
       a. GET  /internal/files/{id}/metadata      → API marks the document "processing"
       b. GET  /internal/files/{id}/base64         (files under 5 MB)
          or   /internal/files/{id}/stream         (5 MB and up)
       c. extracts text, POSTs it to /internal/extracted/fiction   (or /academic + images)
-      d. chunks, embeds, saves vectors in Qdrant
+      d. chunks, writes context notes, embeds (all via LiteLLM), saves vectors in the project's Qdrant collection
       e. POST /webhooks/processing-complete       → API saves chunk links, marks "completed"
          or   /webhooks/processing-failed         → API marks "failed" with the stage + error
  4. API     after each webhook, recalculates the job status (running / completed / partial / failed)
 ```
 
-**The task the API sends** (Celery task name `workers.tasks.process_documents`):
+**The task the API sends** (Celery task name `workers.tasks.process_documents`) — no secrets, so nothing sensitive sits in Redis or shows in Flower:
 ```json
 {
   "task_id": "<job id>",
   "project_id": "uuid",
   "documents": [ { "id": "uuid", "file_size": 2712052 } ],
-  "data_type": "fiction",
-  "credentials": {
-    "llm_provider": "openai", "llm_model": "gpt-4o-mini", "llm_api_key": "sk-...", "llm_base_url": null,
-    "embed_provider": "openai", "embed_model": "text-embedding-3-large", "embed_api_key": "sk-...", "embed_base_url": null,
-    "vision_api_key": "...", "vision_model": "gemini-2.0-flash"
-  }
+  "data_type": "fiction"
 }
 ```
-Stages that aren't configured are simply left out; the worker then falls back to `OPENAI_API_KEY` / `GEMINI_API_KEY` from `.env`.
+
+**The processing config the worker fetches** (`GET /internal/projects/{project_id}/processing-config`):
+```json
+{
+  "project_id": "uuid",
+  "data_type": "fiction",
+  "qdrant_collection": "project_<project id without dashes>",
+  "llm":      { "model": "openai/gpt-4o-mini", "api_key": "sk-...", "api_base": null, "api_version": null,
+                "context_window": 128000, "supports_json_schema": true },
+  "embedder": { "model": "openai/text-embedding-3-large", "api_key": "sk-...", "dimension": 3072, "...": "..." },
+  "vision":   null
+}
+```
+`model` is a LiteLLM model id (`<provider>/<model>`), so the worker can call any provider the same way.
 
 ### Worker-only endpoints
 
@@ -484,6 +536,7 @@ All need the header **`X-Internal-Token: <INTERNAL_API_TOKEN from .env>`**. A no
 
 | Endpoint | Send | Get back |
 |---|---|---|
+| `GET /internal/projects/{project_id}/processing-config` | — | the processing config above (contains keys). `422` if a required model step isn't configured |
 | `GET /internal/files/{document_id}/metadata` | — | `{ document_id, filename, stored_filename, file_size, file_type, data_category, project_id, should_stream }` — `should_stream` is true at 5 MB+ |
 | `GET /internal/files/{document_id}/base64` | — | metadata + `file_data` (base64). `400` if the file is 5 MB+ |
 | `GET /internal/files/{document_id}/stream` | — | the raw file bytes |
@@ -530,8 +583,9 @@ uploaded ──► queued ──► processing ──► completed
 | `users`, `email_events` | accounts, invite emails sent |
 | `projects`, `project_members` | projects and who's in them |
 | `documents` | one row per uploaded file (status lives here) |
-| `provider_credentials` | encrypted API keys |
-| `project_stage_models` | model config: stage → credential + model |
+| `provider_credentials` | connections: encrypted secrets + plain settings |
+| `credential_models` | models registered on Ollama / Azure connections |
+| `project_stage_models` | model config: stage → credential + model (+ measured embedding size) |
 | `processing_jobs`, `job_documents` | jobs and per-document job status |
 | `extractions`, `extracted_images` | where the extracted text/images are in MinIO, plus stats |
 | `chunks` | links each chunk to its Qdrant point |
@@ -546,7 +600,7 @@ projects/{project_id}/extracted/{document_id}/enriched.md     academic, images d
 projects/{project_id}/extracted/{document_id}/images/fig_1.png
 ```
 
-**Qdrant** — the chunk vectors (collections `fiction_chunks`, `academic_chunks`), written by the worker.
+**Qdrant** — the chunk vectors, **one collection per project** (`project_<id without dashes>`), so each project can use its own embedder and vector size. The worker creates and fills it; deleting the project deletes the collection, deleting a document deletes its vectors.
 
 ---
 
@@ -560,9 +614,11 @@ projects/{project_id}/extracted/{document_id}/images/fig_1.png
 | `forbidden` | 403 | needs admin |
 | `account_not_active` | 403 | user was deactivated |
 | `project_access_denied` | 403 | you're a member but need to be owner |
-| `user_not_found`, `project_not_found`, `document_not_found`, `member_not_found`, `credential_not_found`, `job_not_found`, `extraction_not_found` | 404 | doesn't exist (or you're not in that project) |
+| `user_not_found`, `project_not_found`, `document_not_found`, `member_not_found`, `credential_not_found`, `registered_model_not_found`, `job_not_found`, `extraction_not_found` | 404 | doesn't exist (or you're not in that project) |
 | `user_already_exists` | 409 | email already invited |
 | `credential_in_use` | 409 | credential still attached to a project |
+| `model_in_use` | 409 | registered model still used by a project |
+| `model_test_failed` | 422 | the test call to a model failed — the `message` has the provider's reason |
 | `conflict` | 409 | other conflicts — read the `message` |
 | `unsupported_file_type` | 400 | bad file type or content doesn't match the extension |
 | `bad_request` | 400 | e.g. base64 requested for a big file |
@@ -587,7 +643,9 @@ Every request goes **router → service → database**. Routers only deal with H
 | Worker token check | `web_api/deps/internal.py` |
 | Error codes | `web_api/errors.py` |
 | Settings / env vars | `web_api/core/config.py` |
-| Which provider can serve which stage | `STAGE_CAPABILITIES` in `web_api/services/llm_factory.py` |
+| Providers (fields, model source, config page) · which capability each stage needs | `web_api/services/providers.py` — adding a provider = one entry here |
+| Calling models: catalog, live model lists, Ollama discovery, test calls | `web_api/services/llm_gateway.py` (LiteLLM) |
+| Model dropdown, registered models | `web_api/services/ModelCatalogService.py` |
 | Tests showing each flow in action | `web_api/tests/` — readable examples of every endpoint above |
 
 ---
@@ -597,8 +655,8 @@ Every request goes **router → service → database**. Routers only deal with H
 Things that are true today and worth remembering:
 
 - **No token refresh.** Tokens expire after 20 minutes; log in again.
-- **Keys travel through Redis.** Decrypted API keys are inside the Celery task message. Planned fix: the worker fetches them from the API instead.
 - **Any member can delete documents** — not only owners. Change it in `FileMangerRouter.py` if you want owner-only.
-- **Worker bugs** from the audit are not fixed yet (academic pipeline incomplete, embedding size hardcoded in the worker, BM25 hashing, non-OpenAI providers in the worker). The API side is ready for them.
+- **Worker bugs still open** from the audit: BM25 hashing, random point IDs (duplicates on retry), whole-task retries, context-note gaps, chunk overlap duplicates, Marker timeout/key handling (Marker still reads `GEMINI_API_KEY` from `.env`), blocking calls.
+- **Jina embedding models** aren't in LiteLLM's catalog yet — use "Other…" (type the name; it's tested on save).
 - **Images** can be uploaded but not processed yet.
 - **QA generation, review and export** endpoints (in [design.md](design.md) §8.5–8.8) don't exist yet.

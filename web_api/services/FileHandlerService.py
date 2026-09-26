@@ -11,6 +11,7 @@ from web_api.data_models.enums import FileType
 from web_api.db.models import Document, Project, User
 from web_api.errors import DocumentNotFound, FileTooLarge, UnsupportedFileType, ValidationError
 from web_api.services.MinioService import minio_service
+from web_api.services.QdrantService import qdrant_service
 
 logger = logging.getLogger(__name__)
 
@@ -120,16 +121,19 @@ class FileHandlerService:
 
     async def delete_document(self, document: Document) -> None:
         # DB first: a leftover object is harmless, a row pointing at nothing is not
-        storage_key = document.storage_key
+        storage_key, project_id, document_id = document.storage_key, document.project_id, document.id
         await self.session.delete(document)
         await self.session.commit()
         try:
             await minio_service.delete(storage_key)
         except Exception:
             logger.exception("Document row deleted but MinIO object remains: %s", storage_key)
+        await qdrant_service.drop_document(project_id, document_id)
 
     @staticmethod
     async def delete_project_files(project_id: uuid.UUID) -> None:
+        """After the project row is deleted: remove its MinIO objects and its Qdrant collection."""
+        await qdrant_service.drop_project(project_id)
         try:
             removed = await minio_service.delete_prefix(project_prefix(project_id))
             logger.info("Removed %d MinIO objects for project %s", removed, project_id)
