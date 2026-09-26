@@ -1,132 +1,137 @@
+import logging
 import uuid
-from fastapi import UploadFile, HTTPException
-from web_api.data_models.BasicBeanieModels import DocumentModel, ProjectModel
-from web_api.data_models.enums import FileType, Datatype
-from web_api.services.MinioService import minio_service
-from beanie import PydanticObjectId
+from dataclasses import dataclass
 
-_CONTENT_TYPES = {
-    "pdf": "application/pdf",
-    "jpg": "image/jpeg",
-    "jpeg": "image/jpeg",
-    "png": "image/png",
-    "gif": "image/gif",
-    "bmp": "image/bmp",
+from fastapi import UploadFile
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from web_api.core.config import get_settings
+from web_api.data_models.enums import FileType
+from web_api.db.models import Document, Project, User
+from web_api.errors import DocumentNotFound, FileTooLarge, UnsupportedFileType, ValidationError
+from web_api.services.MinioService import minio_service
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _FileKind:
+    file_type: FileType
+    content_type: str
+    magic: tuple[bytes, ...]   # accepted leading bytes
+
+
+_KINDS = {
+    "pdf":  _FileKind(FileType.PDF,    "application/pdf", (b"%PDF-",)),
+    "png":  _FileKind(FileType.IMAGES, "image/png",       (b"\x89PNG\r\n\x1a\n",)),
+    "jpg":  _FileKind(FileType.IMAGES, "image/jpeg",      (b"\xff\xd8\xff",)),
+    "jpeg": _FileKind(FileType.IMAGES, "image/jpeg",      (b"\xff\xd8\xff",)),
+    "gif":  _FileKind(FileType.IMAGES, "image/gif",       (b"GIF87a", b"GIF89a")),
+    "bmp":  _FileKind(FileType.IMAGES, "image/bmp",       (b"BM",)),
 }
+
+_READ_CHUNK = 1024 * 1024
+
+
+def project_prefix(project_id: uuid.UUID) -> str:
+    return f"projects/{project_id}/"
 
 
 class FileHandlerService:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+        self.max_bytes = get_settings().MAX_UPLOAD_MB * 1024 * 1024
 
-    def _get_file_type(self, filename: str) -> FileType:
-        extension = filename.lower().split('.')[-1]
-        if extension == 'pdf':
-            return FileType.PDF
-        elif extension in ['jpg', 'jpeg', 'png', 'gif', 'bmp']:
-            return FileType.IMAGES
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported file type: {extension}")
+    @staticmethod
+    def _kind_for(filename: str) -> tuple[str, _FileKind]:
+        extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        kind = _KINDS.get(extension)
+        if not kind:
+            raise UnsupportedFileType(f"Unsupported file type: .{extension or '?'}")
+        return extension, kind
 
-    async def _validate_project_exists(self, project_id: PydanticObjectId):
-        project = await ProjectModel.get(project_id)
-        if not project:
-            raise HTTPException(status_code=404, detail=f"Project with ID {project_id} not found")
-        return project
+    async def _read_limited(self, file: UploadFile) -> bytes:
+        """Read the upload, stopping as soon as it exceeds the size limit."""
+        chunks, total = [], 0
+        while chunk := await file.read(_READ_CHUNK):
+            total += len(chunk)
+            if total > self.max_bytes:
+                raise FileTooLarge(f"'{file.filename}' exceeds the {self.max_bytes // (1024 * 1024)} MB limit")
+            chunks.append(chunk)
+        return b"".join(chunks)
 
-    async def save_file(self, project_id: str, Type: Datatype, file: UploadFile) -> DocumentModel:
-        try:
-            project_obj_id = PydanticObjectId(project_id)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid project ID format")
-
-        await self._validate_project_exists(project_obj_id)
-
-        original_filename = file.filename
-        file_type = self._get_file_type(original_filename)
-
-        extension = original_filename.split('.')[-1].lower()
-        stored_filename = f"{uuid.uuid4()}.{extension}"
-
-        prefix = "pdfs" if file_type == FileType.PDF else "images"
-        minio_key = f"{prefix}/{stored_filename}"
-        content_type = _CONTENT_TYPES.get(extension, "application/octet-stream")
-
-        try:
-            contents = await file.read()
-            await minio_service.upload(minio_key, contents, content_type)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
-
-        document = DocumentModel(
-            true_title=original_filename,
-            stored_title=stored_filename,
-            file_type=file_type,
-            minio_key=minio_key,
-            data_catgory=Type,
-            project_id=project_obj_id
-        )
-
-        await document.insert()
-        return document
-
-    async def save_multiple_files(self, project_id: str, Type: Datatype, files: list[UploadFile]) -> list[DocumentModel]:
+    async def save_files(self, project: Project, files: list[UploadFile], uploaded_by: User) -> list[Document]:
+        """Validate + upload all files, then insert all rows in one transaction.
+        On any failure nothing is kept: uploaded objects are removed again."""
+        files = [f for f in files if f.filename]
         if not files:
-            raise HTTPException(status_code=400, detail="No files provided")
+            raise ValidationError("No files provided")
 
-        documents = []
-        for file in files:
-            if not file.filename:
-                continue
-            document = await self.save_file(project_id, Type, file)
-            documents.append(document)
+        uploaded_keys: list[str] = []
+        documents: list[Document] = []
+        try:
+            for file in files:
+                extension, kind = self._kind_for(file.filename)
+                data = await self._read_limited(file)
+                if not data:
+                    raise ValidationError(f"'{file.filename}' is empty")
+                if not data.startswith(kind.magic):
+                    raise UnsupportedFileType(f"'{file.filename}' content does not match its .{extension} extension")
 
-        if not documents:
-            raise HTTPException(status_code=400, detail="No valid files were uploaded")
+                document_id = uuid.uuid4()
+                key = f"{project_prefix(project.id)}documents/{document_id}.{extension}"
+                await minio_service.upload(key, data, kind.content_type)
+                uploaded_keys.append(key)
 
+                documents.append(Document(
+                    id=document_id,
+                    project_id=project.id,
+                    original_name=file.filename,
+                    storage_key=key,
+                    file_type=kind.file_type,
+                    content_type=kind.content_type,
+                    size_bytes=len(data),
+                    uploaded_by=uploaded_by.id,
+                ))
+
+            self.session.add_all(documents)
+            await self.session.commit()
+        except BaseException:
+            await self.session.rollback()
+            for key in uploaded_keys:
+                try:
+                    await minio_service.delete(key)
+                except Exception:
+                    logger.exception("Failed to clean up orphaned upload %s", key)
+            raise
         return documents
 
-    async def get_document_by_id(self, document_id: str) -> DocumentModel:
-        try:
-            doc_obj_id = PydanticObjectId(document_id)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid document ID format")
-
-        document = await DocumentModel.get(doc_obj_id)
+    async def get_document(self, document_id: uuid.UUID) -> Document:
+        document = await self.session.get(Document, document_id)
         if not document:
-            raise HTTPException(status_code=404, detail="Document not found")
+            raise DocumentNotFound()
         return document
 
-    async def list_all_documents(self) -> list[DocumentModel]:
-        return await DocumentModel.find_all().to_list()
+    async def list_project_documents(self, project: Project) -> list[Document]:
+        return list(await self.session.scalars(
+            select(Document).where(Document.project_id == project.id).order_by(Document.created_at)
+        ))
 
-    async def get_documents_by_project(self, project_id: str) -> list[DocumentModel]:
+    async def delete_document(self, document: Document) -> None:
+        # DB first: a leftover object is harmless, a row pointing at nothing is not
+        storage_key = document.storage_key
+        await self.session.delete(document)
+        await self.session.commit()
         try:
-            project_obj_id = PydanticObjectId(project_id)
+            await minio_service.delete(storage_key)
         except Exception:
-            raise HTTPException(status_code=400, detail="Invalid project ID format")
+            logger.exception("Document row deleted but MinIO object remains: %s", storage_key)
 
-        await self._validate_project_exists(project_obj_id)
-
-        return await DocumentModel.find(DocumentModel.project_id == project_obj_id).to_list()
-
-    async def delete_document(self, document_id: str):
-        document = await self.get_document_by_id(document_id)
-
+    @staticmethod
+    async def delete_project_files(project_id: uuid.UUID) -> None:
         try:
-            await minio_service.delete(document.minio_key)
+            removed = await minio_service.delete_prefix(project_prefix(project_id))
+            logger.info("Removed %d MinIO objects for project %s", removed, project_id)
         except Exception:
-            pass
-
-        await document.delete()
-        return {"message": "Document deleted successfully"}
-
-    async def delete_documents_by_project(self, project_id: str):
-        documents = await self.get_documents_by_project(project_id)
-
-        for document in documents:
-            try:
-                await minio_service.delete(document.minio_key)
-            except Exception:
-                pass
-            await document.delete()
-
-        return {"message": f"Deleted {len(documents)} documents"}
+            logger.exception("Project deleted but MinIO cleanup failed for %s", project_prefix(project_id))

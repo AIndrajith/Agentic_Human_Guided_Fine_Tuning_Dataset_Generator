@@ -24,6 +24,20 @@ docker run -d --name synthetic_data_mongo -p 27017:27017 -v mongo_data:/data/db 
 docker compose start
 
 ----------------------------------------------------------------
+ 1b. DATABASE SETUP (first time, and after pulling new migrations)
+----------------------------------------------------------------
+cd web_api ; uv run alembic upgrade head ; cd ..              # main DB
+cd web_api ; uv run alembic -x db=test upgrade head ; cd ..   # test DB
+uv run --project web_api python -m web_api.scripts.setup_checkpointer          # LangGraph tables
+uv run --project web_api python -m web_api.scripts.create_admin --email you@x.com --username admin
+
+# new migration after changing web_api/db/models (review the file before upgrading!):
+cd web_api ; uv run alembic revision --autogenerate -m "describe change" ; cd ..
+
+# tests (uses synthetic_data_test; email + MinIO are faked)
+uv run --project web_api pytest web_api/tests
+
+----------------------------------------------------------------
  2. RUN THE SERVICES (two terminals, BOTH from repo root)
 ----------------------------------------------------------------
 # Terminal 1 — web_api  (http://localhost:8000)
@@ -40,8 +54,9 @@ celery -A workers.celery_app worker --loglevel=info --pool=solo
 ----------------------------------------------------------------
  3. .ENV (shared, at repo root — both services read it)
 ----------------------------------------------------------------
-MONGODB_URL, DATABASE_NAME, MINIO_*, ENCRYPTION_KEY,
-OPENAI_API_KEY, GEMINI_API_KEY, (opt) CELERY_*, QDRANT_URL, WEB_API_URL
+See .env.example. Key ones: DATABASE_URL, MIGRATION_DATABASE_URL, JWT_SECRET_KEY,
+ENCRYPTION_KEY, MINIO_*, RESEND_API_KEY + FROM_EMAIL (unset = invite links are logged instead)
+Use 127.0.0.1 (not localhost) in DB URLs: localhost tries IPv6 first on Windows -> ~2 min delay
 
 Generate ENCRYPTION_KEY:
   web_api\.venv\Scripts\python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
