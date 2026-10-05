@@ -1,42 +1,44 @@
-from beanie import Document, PydanticObjectId
-from pydantic import BaseModel, model_validator
-from typing import Optional, Dict
+import uuid
 from datetime import datetime
-from pydantic import Field
+from typing import Optional
+
+from pydantic import BaseModel, Field
+
 from web_api.data_models.enums import ModelProvider, ModelStage
 
 
 class StageModelConfig(BaseModel):
-    provider:   ModelProvider
-    model_name: str
-    base_url:   Optional[str] = None   # required for Ollama
-
-    @model_validator(mode="after")
-    def require_base_url_for_ollama(self):
-        if self.provider == ModelProvider.OLLAMA and not self.base_url:
-            raise ValueError("base_url is required when provider is ollama")
-        return self
-
-
-class ProjectModelConfigModel(Document):
-    project_id:       PydanticObjectId
-    stages:           Dict[str, StageModelConfig]   # key = ModelStage value string
-    embedding_locked: bool = False                   # True once first document is embedded
-    created_at:       datetime = Field(default_factory=datetime.utcnow)
-    updated_at:       datetime = Field(default_factory=datetime.utcnow)
-
-    class Settings:
-        name = "project_model_configs"
+    """One stage's assignment: which global credential + which model.
+    The embedding size is measured with a test call when saved, never typed."""
+    credential_id: uuid.UUID
+    model_name:    str = Field(min_length=1, max_length=200)
 
 
 class SetModelConfigRequest(BaseModel):
-    stages: Dict[ModelStage, StageModelConfig]
+    stages: dict[ModelStage, StageModelConfig]
+
+
+class StageModelResponse(BaseModel):
+    stage:           ModelStage
+    credential_id:   uuid.UUID
+    credential_name: str
+    provider:        ModelProvider
+    model_name:      str
+    embedding_dim:   Optional[int]
+    updated_at:      datetime
+
+
+class ModelConfigResponse(BaseModel):
+    project_id:       uuid.UUID
+    embedding_locked: bool
+    stages:           list[StageModelResponse]
 
 
 class StageValidationResult(BaseModel):
-    stage: ModelStage
-    ok:    bool
-    error: Optional[str] = None
+    stage:         ModelStage
+    ok:            bool
+    embedding_dim: Optional[int] = None
+    error:         Optional[str] = None
 
 
 class ValidateModelConfigResponse(BaseModel):

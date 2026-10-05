@@ -1,27 +1,34 @@
-import os
-import io
 import asyncio
+import io
 import logging
+
 from minio import Minio
+from minio.deleteobjects import DeleteObject
+
+from web_api.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 
 class MinioService:
     def __init__(self):
+        settings = get_settings()
         self.client = Minio(
-            endpoint=os.getenv("MINIO_ENDPOINT", "localhost:9000"),
-            access_key=os.getenv("MINIO_ACCESS_KEY", "minioadmin"),
-            secret_key=os.getenv("MINIO_SECRET_KEY", "minioadmin"),
-            secure=os.getenv("MINIO_SECURE", "false").lower() == "true"
+            endpoint=settings.MINIO_ENDPOINT,
+            access_key=settings.MINIO_ACCESS_KEY,
+            secret_key=settings.MINIO_SECRET_KEY.get_secret_value(),
+            secure=settings.MINIO_SECURE,
         )
-        self.bucket = os.getenv("MINIO_BUCKET", "synthetic-data")
+        self.bucket = settings.MINIO_BUCKET
+
+    async def ensure_bucket(self) -> None:
+        """Called once at startup (no network I/O at import time)."""
         try:
-            if not self.client.bucket_exists(self.bucket):
-                self.client.make_bucket(self.bucket)
-                logger.info(f"Created MinIO bucket: {self.bucket}")
+            if not await asyncio.to_thread(self.client.bucket_exists, self.bucket):
+                await asyncio.to_thread(self.client.make_bucket, self.bucket)
+                logger.info("Created MinIO bucket: %s", self.bucket)
         except Exception as e:
-            logger.warning(f"MinIO bucket init failed (will retry on first use): {e}")
+            logger.warning("MinIO bucket init failed (uploads will fail until MinIO is reachable): %s", e)
 
     async def upload(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> str:
         await asyncio.to_thread(
@@ -45,6 +52,20 @@ class MinioService:
 
     async def delete(self, key: str):
         await asyncio.to_thread(self.client.remove_object, self.bucket, key)
+
+    async def delete_prefix(self, prefix: str) -> int:
+        """Delete every object under `prefix`. Returns how many were removed."""
+        def _delete() -> int:
+            objects = [DeleteObject(o.object_name) for o in
+                       self.client.list_objects(self.bucket, prefix=prefix, recursive=True)]
+            if not objects:
+                return 0
+            errors = list(self.client.remove_objects(self.bucket, objects))  # lazy: must be consumed
+            for err in errors:
+                logger.error("MinIO delete failed for %s: %s", err.name, err.message)
+            return len(objects) - len(errors)
+
+        return await asyncio.to_thread(_delete)
 
     async def stream(self, key: str):
         loop = asyncio.get_running_loop()

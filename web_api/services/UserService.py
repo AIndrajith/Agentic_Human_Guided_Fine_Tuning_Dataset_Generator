@@ -1,84 +1,43 @@
-from web_api.services.SecurityService import SecurityService
-from beanie import PydanticObjectId
-from web_api.data_models.UserModels import UserModel
+import uuid
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from web_api.data_models.enums import AppRole
+from web_api.db.models import User
 from web_api.errors import UserNotFound
 
-class UserService:
-    def __init__(self,SecurityService: SecurityService):
-        self.security_service = SecurityService
 
-    async def find_email(self, email: str) -> UserModel | None:
-        return await UserModel.find_one(UserModel.email == email)
-    
-    async def add_new_user(self, email: str, app_role: str, setup_token: str, setup_token_expiry) -> UserModel:
-        new_user = UserModel(
-            email=email,
-            app_role=app_role,
-            setup_token=setup_token,
-            setup_token_expiry=setup_token_expiry
-        )
-        try:
-            await new_user.insert()
-        except Exception as e:
-            raise RuntimeError("Failed to add new user") from e
-        return new_user
-    
-    async def is_user_active(self, user_id: PydanticObjectId) -> bool:
-        user = await UserModel.get(user_id)
+class UserService:
+    """Data access for users. Callers own the transaction (commit)."""
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    @staticmethod
+    def normalize_email(email: str) -> str:
+        return email.strip().lower()
+
+    async def get(self, user_id: uuid.UUID) -> User:
+        user = await self.session.get(User, user_id)
         if not user:
             raise UserNotFound()
-        return user.is_active
-    
-    async def is_must_change_password(self, user_id: PydanticObjectId) -> bool:
-        user = await UserModel.get(user_id)
-        if not user:
-            raise UserNotFound()
-        return user.must_change_password
-    
-    async def update_username(self, user_id: PydanticObjectId, new_username: str):
-        user = await UserModel.get(user_id)
-        if not user:
-            raise UserNotFound()
-        user.username = new_username
-        try:
-            await user.save()
-        except Exception as e:
-            raise RuntimeError("Failed to update username") from e
-        
-    async def update_password(self, user_id: PydanticObjectId, hashed_password: str):
-        user = await UserModel.get(user_id)
-        if not user:
-            raise UserNotFound()
-        user.hashed_password = hashed_password
-        try:
-            await user.save()
-        except Exception as e:
-            raise RuntimeError("Failed to update password") from e
-        
-    async def update_UserName_and_Password(self, user_id: PydanticObjectId, new_username: str, hashed_password: str):
-        user = await UserModel.get(user_id)
-        if not user:
-            raise UserNotFound()
-        user.username = new_username
-        user.hashed_password = hashed_password
-        try:
-            await user.save()
-            return user.id
-        except Exception as e:
-            raise RuntimeError("Failed to update username and password") from e
-        
-    async def find_email(self, email: str) -> UserModel | None:
-        return await UserModel.find_one(UserModel.email == email)
-    
-    async def find_user_by_token(self, token: str) -> UserModel | None:
-        return await UserModel.find_one(UserModel.setup_token == token)
-    
-    async def change_must_change_password(self, user_id: PydanticObjectId, must_change: bool):
-        user = await UserModel.get(user_id)
-        if not user:
-            raise UserNotFound()
-        user.must_change_password = must_change
-        try:
-            await user.save()
-        except Exception as e:
-            raise RuntimeError("Failed to update must_change_password") from e
+        return user
+
+    async def find_by_email(self, email: str) -> User | None:
+        return await self.session.scalar(select(User).where(User.email == self.normalize_email(email)))
+
+    async def find_by_username(self, username: str) -> User | None:
+        return await self.session.scalar(select(User).where(User.username == username))
+
+    async def find_by_token_hash(self, token_hash: str) -> User | None:
+        return await self.session.scalar(select(User).where(User.setup_token_hash == token_hash))
+
+    async def list_all(self) -> list[User]:
+        return list(await self.session.scalars(select(User).order_by(User.created_at)))
+
+    async def add_invited_user(self, email: str, app_role: AppRole) -> User:
+        user = User(email=self.normalize_email(email), app_role=app_role)
+        self.session.add(user)
+        await self.session.flush()
+        return user

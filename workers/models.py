@@ -8,28 +8,42 @@ class TaskDocument(BaseModel):
     file_size: int
 
 
-class TaskCredentials(BaseModel):
-    """Decrypted provider credentials forwarded from web_api at dispatch time."""
-    llm_provider:  Optional[str] = None
-    llm_api_key:   Optional[str] = None
-    llm_model:     Optional[str] = None
-    llm_base_url:  Optional[str] = None
-
-    embed_provider: Optional[str] = None
-    embed_api_key:  Optional[str] = None
-    embed_model:    Optional[str] = None
-    embed_base_url: Optional[str] = None
-
-    vision_api_key: Optional[str] = None
-    vision_model:   Optional[str] = None
-
-
 class TaskData(BaseModel):
+    """Celery payload. Holds no keys: those come from ProcessingConfig."""
     task_id:     str
     project_id:  str
     documents:   List[TaskDocument]
     data_type:   str
-    credentials: Optional[TaskCredentials] = None
+
+
+class ModelEndpoint(BaseModel):
+    """One LiteLLM model + its connection, from web_api's processing config."""
+    model:                str                  # LiteLLM model id, e.g. "anthropic/claude-sonnet-4-5"
+    api_key:              Optional[str] = None
+    api_base:             Optional[str] = None
+    api_version:          Optional[str] = None
+    context_window:       Optional[int] = None
+    supports_json_schema: bool = False
+
+    def call_kwargs(self) -> Dict[str, str]:
+        """Arguments for litellm.acompletion / aembedding (besides model + input)."""
+        return {k: v for k, v in {
+            "api_key": self.api_key, "api_base": self.api_base, "api_version": self.api_version,
+        }.items() if v}
+
+
+class EmbedderEndpoint(ModelEndpoint):
+    dimension: int
+
+
+class ProcessingConfig(BaseModel):
+    """GET /internal/projects/{id}/processing-config. Fetched once per task, kept in memory only."""
+    project_id:        str
+    data_type:         str
+    qdrant_collection: str
+    llm:               ModelEndpoint            # context notes
+    embedder:          EmbedderEndpoint
+    vision:            Optional[ModelEndpoint] = None   # academic image descriptions
 
 
 class FileMetadata(BaseModel):

@@ -1,50 +1,46 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, Query
+import uuid
+
+from fastapi import APIRouter, File, UploadFile, status
+
+from web_api.data_models.DataModels import DocumentResponse
+from web_api.deps.auth import CurrentUser, SessionDep
+from web_api.deps.projects import ProjectMemberAccess, ensure_project_access
 from web_api.services.FileHandlerService import FileHandlerService
-from web_api.data_models.BasicBeanieModels import DocumentModel
-from web_api.data_models.enums import Datatype
 
-router = APIRouter(prefix="/files", tags=["File Management"])
-file_service = FileHandlerService()
+router = APIRouter(tags=["File Management"])
 
-@router.post("/upload", response_model=DocumentModel)
-async def upload_file(
-    project_id: str = Query(..., description="Project ID to associate the file with"),
-    Type: Datatype = Query(..., description="Data category"),
-    file: UploadFile = File(...)
+
+@router.post(
+    "/projects/{project_id}/documents",
+    response_model=list[DocumentResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_documents(
+    project: ProjectMemberAccess,
+    user: CurrentUser,
+    session: SessionDep,
+    files: list[UploadFile] = File(...),
 ):
-    """Upload a single file to a project"""
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file provided")
-    
-    document = await file_service.save_file(project_id, Type, file)
+    """Upload one or more PDFs/images to a project (all-or-nothing)."""
+    return await FileHandlerService(session).save_files(project, files, user)
+
+
+@router.get("/projects/{project_id}/documents", response_model=list[DocumentResponse])
+async def list_project_documents(project: ProjectMemberAccess, session: SessionDep):
+    return await FileHandlerService(session).list_project_documents(project)
+
+
+@router.get("/documents/{document_id}", response_model=DocumentResponse)
+async def get_document(document_id: uuid.UUID, user: CurrentUser, session: SessionDep):
+    service = FileHandlerService(session)
+    document = await service.get_document(document_id)
+    await ensure_project_access(session, user, document.project_id)
     return document
 
-@router.post("/upload-multiple", response_model=list[DocumentModel])
-async def upload_multiple_files(
-    project_id: str = Query(..., description="Project ID to associate the files with"),
-    Type: Datatype = Query(..., description="Data category"),
-    files: list[UploadFile] = File(...)
-):
-    """Upload multiple files to a project"""
-    documents = await file_service.save_multiple_files(project_id, Type, files)
-    return documents
 
-@router.get("/{document_id}", response_model=DocumentModel)
-async def get_document(document_id: str):
-    """Get a specific document by ID"""
-    return await file_service.get_document_by_id(document_id)
-
-@router.get("/", response_model=list[DocumentModel])
-async def list_documents():
-    """List all documents"""
-    return await file_service.list_all_documents()
-
-@router.get("/project/{project_id}", response_model=list[DocumentModel])
-async def get_project_documents(project_id: str):
-    """Get all documents for a specific project"""
-    return await file_service.get_documents_by_project(project_id)
-
-@router.delete("/{document_id}")
-async def delete_document(document_id: str):
-    """Delete a specific document"""
-    return await file_service.delete_document(document_id)
+@router.delete("/documents/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_document(document_id: uuid.UUID, user: CurrentUser, session: SessionDep):
+    service = FileHandlerService(session)
+    document = await service.get_document(document_id)
+    await ensure_project_access(session, user, document.project_id)
+    await service.delete_document(document)

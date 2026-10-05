@@ -4,8 +4,9 @@ Webhook notification utilities.
 
 import httpx
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from workers.config import Config
+from workers.utils.retry import retry_async
 import logging
 
 logger = logging.getLogger(__name__)
@@ -16,7 +17,14 @@ class WebhookNotifier:
     
     def __init__(self):
         self.api_base_url = Config.WEB_API_BASE_URL
-    
+
+    @staticmethod
+    async def _post(url: str, payload: dict):
+        async with httpx.AsyncClient(headers=Config.internal_headers(), timeout=30.0) as client:
+            response = await client.post(url, json=payload)
+            response.raise_for_status()
+            return response.json()
+
     async def notify_processing_complete(
         self,
         task_id: str,
@@ -52,17 +60,13 @@ class WebhookNotifier:
             "total_chunks": total_chunks,
             "chunks_data": chunks_data,
             "error_message": error_message,
-            "completed_at": datetime.utcnow().isoformat()
+            "completed_at": datetime.now(timezone.utc).isoformat()
         }
         
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(url, json=payload)
-                response.raise_for_status()
-                
-                logger.info(f"Successfully notified web_api of completion for document {document_id}")
-                return response.json()
-                
+            result = await retry_async(self._post, url, payload, what="processing-complete webhook")
+            logger.info(f"Successfully notified web_api of completion for document {document_id}")
+            return result
         except Exception as e:
             logger.error(f"Failed to notify web_api: {str(e)}")
             # Don't raise - notification failure shouldn't fail the task
@@ -94,13 +98,9 @@ class WebhookNotifier:
         }
         
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(url, json=payload)
-                response.raise_for_status()
-                
-                logger.info(f"Notified web_api of failure for document {document_id}")
-                return response.json()
-                
+            result = await retry_async(self._post, url, payload, what="processing-failed webhook")
+            logger.info(f"Notified web_api of failure for document {document_id}")
+            return result
         except Exception as e:
             logger.error(f"Failed to notify web_api of failure: {str(e)}")
             return None

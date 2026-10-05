@@ -1,93 +1,139 @@
-from fastapi import HTTPException
-from beanie import PydanticObjectId
-from datetime import datetime
+from datetime import datetime, timezone
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from web_api.data_models.enums import ModelStage, RegisteredModelStatus
 from web_api.data_models.ModelConfigModels import (
-    ProjectModelConfigModel,
+    ModelConfigResponse,
     SetModelConfigRequest,
+    StageModelConfig,
+    StageModelResponse,
     StageValidationResult,
     ValidateModelConfigResponse,
 )
-from web_api.data_models.enums import ModelStage
-from web_api.services.llm_factory import STAGE_CAPABILITIES, ping_stage
+from web_api.db.models import Project, ProjectStageModel, ProviderCredential
+from web_api.errors import AppError, ConflictError, CredentialNotFound, ModelTestFailed, ValidationError
+from web_api.services import llm_gateway
+from web_api.services.credential_service import CredentialService
+from web_api.services.llm_gateway import ProbeResult
+from web_api.services.ModelCatalogService import ModelCatalogService
+from web_api.services.providers import STAGE_CAPABILITY, ModelSource, get_spec
 
 
 class ModelConfigService:
+    """Per-project stage -> (global credential, model) assignments."""
 
-    @staticmethod
-    async def set_config(project_id: str, request: SetModelConfigRequest) -> ProjectModelConfigModel:
-        obj_id = PydanticObjectId(project_id)
-        existing = await ProjectModelConfigModel.find_one(
-            ProjectModelConfigModel.project_id == obj_id
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def get_config(self, project: Project) -> ModelConfigResponse:
+        rows = await self.session.execute(
+            select(ProjectStageModel, ProviderCredential)
+            .join(ProviderCredential, ProviderCredential.id == ProjectStageModel.credential_id)
+            .where(ProjectStageModel.project_id == project.id)
+            .order_by(ProjectStageModel.stage)
+        )
+        return ModelConfigResponse(
+            project_id=project.id,
+            embedding_locked=project.embedding_locked,
+            stages=[
+                StageModelResponse(
+                    stage=stage_model.stage,
+                    credential_id=credential.id,
+                    credential_name=credential.name,
+                    provider=credential.provider,
+                    model_name=stage_model.model_name,
+                    embedding_dim=stage_model.embedding_dim,
+                    updated_at=stage_model.updated_at,
+                )
+                for stage_model, credential in rows
+            ],
         )
 
-        if existing and existing.embedding_locked and ModelStage.EMBEDDER in request.stages:
-            new_embed = request.stages[ModelStage.EMBEDDER]
-            old_embed = existing.stages.get(ModelStage.EMBEDDER.value)
-            if old_embed and (
-                new_embed.provider != old_embed.provider or
-                new_embed.model_name != old_embed.model_name
+    async def _test_stage(self, stage: ModelStage, config: StageModelConfig) -> ProbeResult:
+        """Check the model fits the stage, then make one tiny real call with it."""
+        credential = await self.session.get(ProviderCredential, config.credential_id)
+        if not credential:
+            raise CredentialNotFound(f"Credential {config.credential_id} not found (stage '{stage.value}')")
+        spec = get_spec(credential.provider)
+        capability = STAGE_CAPABILITY[stage]
+        name = config.model_name.strip()
+
+        registered = None
+        if spec.model_source == ModelSource.REGISTERED:
+            registered = await ModelCatalogService(self.session).find_registered(credential.id, name)
+            if registered is None:
+                raise ValidationError(
+                    f"'{name}' is not registered on connection '{credential.name}'. Add it on the connection page first."
+                )
+            known = registered.capabilities
+        else:
+            info = llm_gateway.catalog_lookup(credential.provider, name)
+            known = [c.value for c in info.capabilities] if info else []
+            if info and not known:
+                raise ValidationError(f"'{name}' is not a chat, embedding or rerank model")
+        if known and capability.value not in known:
+            raise ValidationError(
+                f"'{name}' can't be used for stage '{stage.value}' (needs {capability.value}; it supports {', '.join(known)})"
+            )
+
+        connection = CredentialService.connection_for(credential)
+        try:
+            result = await llm_gateway.probe(connection, name, capability)
+        except ModelTestFailed as e:
+            raise ModelTestFailed(f"Stage '{stage.value}': {e.message}") from e
+
+        if registered is not None:
+            registered.status, registered.last_error = RegisteredModelStatus.OK, None
+            registered.last_checked_at = datetime.now(timezone.utc)
+            registered.embedding_dim = result.embedding_dim or registered.embedding_dim
+        return result
+
+    async def set_config(self, project: Project, request: SetModelConfigRequest) -> ModelConfigResponse:
+        """Upsert the given stages (each is test-called first); stages not in the request are left unchanged."""
+        for stage, config in request.stages.items():
+            existing = await self.session.get(ProjectStageModel, (project.id, stage))
+            if stage == ModelStage.EMBEDDER and project.embedding_locked and existing and (
+                existing.credential_id != config.credential_id or existing.model_name != config.model_name.strip()
             ):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Embedder config is locked after first document was processed. "
-                        "Changing it would corrupt existing Qdrant vectors."
-                    )
+                raise ConflictError(
+                    "Embedder is locked after the first document was processed; "
+                    "changing it would make existing vectors incompatible."
                 )
 
-        for stage, config in request.stages.items():
-            allowed = STAGE_CAPABILITIES.get(stage, set())
-            if config.provider not in allowed:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Provider '{config.provider}' cannot serve stage '{stage}'. "
-                           f"Allowed: {[p.value for p in allowed]}"
-                )
+            result = await self._test_stage(stage, config)
+            embedding_dim = result.embedding_dim if stage == ModelStage.EMBEDDER else None
 
-        stages_dict = {stage.value: config for stage, config in request.stages.items()}
-
-        if existing:
-            existing.stages.update(stages_dict)
-            existing.updated_at = datetime.utcnow()
-            await existing.save()
-            return existing
-
-        config_doc = ProjectModelConfigModel(project_id=obj_id, stages=stages_dict)
-        await config_doc.insert()
-        return config_doc
-
-    @staticmethod
-    async def get_config(project_id: str) -> ProjectModelConfigModel:
-        obj_id = PydanticObjectId(project_id)
-        config = await ProjectModelConfigModel.find_one(
-            ProjectModelConfigModel.project_id == obj_id
-        )
-        if not config:
-            raise HTTPException(status_code=404, detail="No model config found for this project")
-        return config
-
-    @staticmethod
-    async def validate_config(project_id: str, request: SetModelConfigRequest) -> ValidateModelConfigResponse:
-        results: list[StageValidationResult] = []
-
-        for stage, config in request.stages.items():
-            allowed = STAGE_CAPABILITIES.get(stage, set())
-            if config.provider not in allowed:
-                results.append(StageValidationResult(
-                    stage=stage,
-                    ok=False,
-                    error=f"Provider '{config.provider}' cannot serve stage '{stage}'"
+            if existing:
+                existing.credential_id = config.credential_id
+                existing.model_name = config.model_name.strip()
+                existing.embedding_dim = embedding_dim
+            else:
+                self.session.add(ProjectStageModel(
+                    project_id=project.id, stage=stage, credential_id=config.credential_id,
+                    model_name=config.model_name.strip(), embedding_dim=embedding_dim,
                 ))
-                continue
 
+        await self.session.commit()
+        return await self.get_config(project)
+
+    async def remove_stage(self, project: Project, stage: ModelStage) -> None:
+        if stage == ModelStage.EMBEDDER and project.embedding_locked:
+            raise ConflictError("Embedder is locked after the first document was processed")
+        existing = await self.session.get(ProjectStageModel, (project.id, stage))
+        if existing:
+            await self.session.delete(existing)
+            await self.session.commit()
+
+    async def validate_config(self, request: SetModelConfigRequest) -> ValidateModelConfigResponse:
+        """Dry run: check each stage and make a tiny live call. Saves nothing."""
+        results: list[StageValidationResult] = []
+        for stage, config in request.stages.items():
             try:
-                await ping_stage(config.provider, config.model_name, stage, config)
-                results.append(StageValidationResult(stage=stage, ok=True))
-            except Exception as e:
-                results.append(StageValidationResult(stage=stage, ok=False, error=str(e)))
-
-        return ValidateModelConfigResponse(
-            all_ok=all(r.ok for r in results),
-            results=results,
-        )
+                result = await self._test_stage(stage, config)
+                results.append(StageValidationResult(stage=stage, ok=True, embedding_dim=result.embedding_dim))
+            except AppError as e:
+                results.append(StageValidationResult(stage=stage, ok=False, error=e.message))
+        await self.session.rollback()   # _test_stage may have touched registered-model status
+        return ValidateModelConfigResponse(all_ok=all(r.ok for r in results), results=results)
