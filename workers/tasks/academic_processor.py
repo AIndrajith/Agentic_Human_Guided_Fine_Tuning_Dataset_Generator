@@ -1,9 +1,9 @@
-from workers.models import TaskDocument, TaskCredentials
+from workers.models import TaskDocument, ProcessingConfig
 from workers.services.file_fetcher import FileFetcherService
 from workers.services.pdf_to_markdown import PDFToMarkdownService
 from workers.services.vision_service import VisionService
 from workers.services.chunking_service_academic import AcademicChunkingService
-from workers.services.contextualizer import Contextualizer
+from workers.services.contextualizer import Contextualizer, plan_context_budget
 from workers.services.embedding_service import EmbeddingService
 from workers.services.bm25_service import BM25Service
 from workers.services.storage_service import StorageService
@@ -12,7 +12,7 @@ from workers.utils.temp_file_manager import TempFileManager
 from workers.utils.webhook_notifier import WebhookNotifier
 from workers.enums import ProcessingStage
 from workers.config import Config
-from typing import Optional
+from workers.utils.tokenizer import chunk_tokenizer
 import logging
 import re
 from pathlib import Path
@@ -26,9 +26,7 @@ class AcademicProcessor:
     def __init__(self):
         self.file_fetcher = FileFetcherService()
         self.pdf_to_markdown = PDFToMarkdownService()
-        self.chunking_service = AcademicChunkingService()
         self.bm25_service = BM25Service()
-        self.storage_service = StorageService()
         self.extracted_storage = ExtractedContentStorageService()
         self.temp_file_manager = TempFileManager()
         self.webhook_notifier = WebhookNotifier()
@@ -38,22 +36,13 @@ class AcademicProcessor:
         task_id: str,
         document: TaskDocument,
         project_id: str,
-        credentials: Optional[TaskCredentials] = None,
+        config: ProcessingConfig,
     ) -> dict:
-        self.vision_service = VisionService(
-            api_key=credentials.vision_api_key if credentials else None,
-            model_name=credentials.vision_model if credentials else None,
-        )
-        self.contextualizer = Contextualizer(
-            api_key=credentials.llm_api_key if credentials else None,
-            model=credentials.llm_model if credentials else None,
-            base_url=credentials.llm_base_url if credentials else None,
-        )
-        self.embedding_service = EmbeddingService(
-            api_key=credentials.embed_api_key if credentials else None,
-            model=credentials.embed_model if credentials else None,
-            base_url=credentials.embed_base_url if credentials else None,
-        )
+        if config.vision is None:
+            raise ValueError("Academic processing needs a vision model step")
+        self.vision_service = VisionService(config.vision)
+        self.embedding_service = EmbeddingService(config.embedder)
+        self.storage_service = StorageService(config.qdrant_collection, config.embedder.dimension)
 
         document_id = document.id
         current_stage = ProcessingStage.FETCHING_FILES
@@ -74,17 +63,19 @@ class AcademicProcessor:
             )
             
             # ===== 2. Convert PDF → Markdown =====
-            logger.info(f"[{document_id}] Stage: PDF_TO_MARKDOWN")
-            current_stage = "pdf_to_markdown"
+            logger.info(f"[{document_id}] Stage: {ProcessingStage.PDF_TO_MARKDOWN.value}")
+            current_stage = ProcessingStage.PDF_TO_MARKDOWN
             
             marker_output_dir = self.temp_file_manager.get_file_path(
                 task_id,
                 f"{document_id}_marker_output"
             )
             
-            marker_output = self.pdf_to_markdown.convert_pdf(
+            # Marker's LLM step uses the project's vision model; runs as a child process (non-blocking)
+            marker_output = await self.pdf_to_markdown.convert_pdf(
                 pdf_path=pdf_path,
-                output_dir=marker_output_dir
+                output_dir=marker_output_dir,
+                vision=config.vision,
             )
             
             logger.info(
@@ -95,12 +86,12 @@ class AcademicProcessor:
             
             # ===== 3. Caption Images with Context =====
             if marker_output.images:
-                logger.info(f"[{document_id}] Stage: IMAGE_CAPTIONING")
-                current_stage = "image_captioning"
+                logger.info(f"[{document_id}] Stage: {ProcessingStage.IMAGE_CAPTIONING.value}")
+                current_stage = ProcessingStage.IMAGE_CAPTIONING
                 
                 # Parse markdown to get image references with positions
-                chef = MarkdownChef(tokenizer=Config.CHONKIE_TOKENIZER)
-                doc_parsed = chef.process(marker_output.markdown_text)
+                chef = MarkdownChef(tokenizer=chunk_tokenizer())
+                doc_parsed = chef.parse(marker_output.markdown_text)   # parse(text); process() expects a file path
                 
                 image_descriptions = await self.vision_service.caption_images_with_context(
                     markdown_content=marker_output.markdown_text,
@@ -114,8 +105,9 @@ class AcademicProcessor:
                 logger.info(f"[{document_id}] No images to caption")
             
             # ===== 4. Replace Images with Descriptions =====
-            logger.info(f"[{document_id}] Stage: IMAGE_REPLACEMENT")
-            
+            logger.info(f"[{document_id}] Stage: {ProcessingStage.IMAGE_REPLACEMENT.value}")
+            current_stage = ProcessingStage.IMAGE_REPLACEMENT
+
             enriched_markdown = self._replace_images_with_descriptions(
                 marker_output.markdown_text,
                 image_descriptions
@@ -124,8 +116,8 @@ class AcademicProcessor:
             logger.info(f"[{document_id}] Image replacement complete")
             
             # ===== 4.5. Store Extracted Academic Content =====
-            logger.info(f"[{document_id}] Stage: STORING_EXTRACTED_ACADEMIC")
-            current_stage = "storing_extracted_academic"
+            logger.info(f"[{document_id}] Stage: {ProcessingStage.STORING_EXTRACTED_CONTENT.value}")
+            current_stage = ProcessingStage.STORING_EXTRACTED_CONTENT
             
             try:
                 # Step 1: Upload images to internal API
@@ -150,7 +142,7 @@ class AcademicProcessor:
                     for img in marker_output.images
                 ]
                 
-                # Step 3: Store markdown and metadata in MongoDB
+                # Step 3: Store markdown and metadata via web_api
                 extraction_metadata = {
                     "marker_config": marker_output.metadata["marker_config"],
                     "character_count": len(enriched_markdown),
@@ -166,7 +158,7 @@ class AcademicProcessor:
                     images=image_metadata_list,
                     extraction_metadata=extraction_metadata
                 )
-                logger.info(f"[{document_id}] Successfully stored academic content in MongoDB")
+                logger.info(f"[{document_id}] Stored academic content via web_api")
                 
             except Exception as e:
                 logger.error(f"[{document_id}] Failed to store academic content: {str(e)}")
@@ -175,7 +167,14 @@ class AcademicProcessor:
             # ===== 5. Smart Hierarchical Chunking =====
             logger.info(f"[{document_id}] Stage: {ProcessingStage.CHUNKING.value}")
             current_stage = ProcessingStage.CHUNKING
-            
+
+            # parent + batch size follow the meta_agent model's context window (whole parent goes in the prompt)
+            budget = plan_context_budget(config.llm.context_window, child_tokens=Config.ACADEMIC_CHILD_CHUNK_SIZE)
+            self.chunking_service = AcademicChunkingService(
+                parent_chunk_size=budget.parent_tokens, parent_overlap=budget.parent_overlap
+            )
+            self.contextualizer = Contextualizer(config.llm, budget)
+
             context_chunks, child_chunks = self.chunking_service.create_hierarchical_chunks(
                 enriched_markdown
             )
@@ -213,38 +212,53 @@ class AcademicProcessor:
             logger.info(f"[{document_id}] Stage: {ProcessingStage.GENERATING_BM25.value}")
             current_stage = ProcessingStage.GENERATING_BM25
             
-            sparse_vectors = self.bm25_service.generate_sparse_vectors(combined_texts)
-            
+            # BM25: Qdrant computes the vectors from the text on upsert
+            sparse_vectors = self.bm25_service.documents(combined_texts)
+
             # ===== 9. Store in Qdrant =====
             logger.info(f"[{document_id}] Stage: {ProcessingStage.STORING_VECTORS.value}")
             current_stage = ProcessingStage.STORING_VECTORS
-            
-            await self.storage_service.store_vectors(
-                collection_name=Config.QDRANT_COLLECTION_ACADEMIC,
+
+            point_ids = await self.storage_service.store_chunks(
                 chunks=contextualized_chunks,
                 dense_vectors=dense_vectors,
                 sparse_vectors=sparse_vectors,
                 document_id=document_id,
-                project_id=project_id
+                project_id=project_id,
+                book_metadata=paper_metadata,
+                data_category="academic"
             )
-            
+
             # ===== 10. Notify Completion =====
             logger.info(f"[{document_id}] Stage: {ProcessingStage.NOTIFYING_COMPLETION.value}")
             current_stage = ProcessingStage.NOTIFYING_COMPLETION
-            
-            await self.webhook_notifier.notify_completion(
+
+            chunks_data = [
+                {
+                    "chunk_index": chunk.index,
+                    "qdrant_point_id": point_id,
+                    "metadata": chunk.metadata
+                }
+                for chunk, point_id in zip(contextualized_chunks, point_ids)
+            ]
+
+            await self.webhook_notifier.notify_processing_complete(
                 task_id=task_id,
                 document_id=document_id,
-                status="success"
+                project_id=project_id,
+                status="completed",
+                chunks_processed=len(contextualized_chunks),
+                total_chunks=len(contextualized_chunks),
+                chunks_data=chunks_data
             )
-            
+
             # ===== 11. Cleanup Temp Files =====
-            self.temp_file_manager.cleanup_task_files(task_id)
-            
+            self.temp_file_manager.cleanup_task_directory(task_id, force=True)
+
             logger.info(f"[{document_id}] Processing complete!")
-            
+
             return {
-                "status": "success",
+                "status": "completed",
                 "document_id": document_id,
                 "parent_chunks": len(context_chunks),
                 "child_chunks": len(child_chunks),
@@ -254,15 +268,15 @@ class AcademicProcessor:
             
         except Exception as e:
             logger.error(
-                f"[{document_id}] Failed at stage {current_stage}: {str(e)}",
+                f"[{document_id}] Failed at stage {current_stage.value}: {str(e)}",
                 exc_info=True
             )
 
-            await self.webhook_notifier.notify_completion(
+            await self.webhook_notifier.notify_processing_failed(
                 task_id=task_id,
                 document_id=document_id,
-                status="failed",
-                error=str(e)
+                error_message=str(e),
+                stage=current_stage.value
             )
             
             raise

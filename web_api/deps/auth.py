@@ -1,49 +1,61 @@
+import uuid
+from typing import Annotated
+
 from fastapi import Depends, Request
 from fastapi.security import OAuth2PasswordBearer
-from web_api.errors import InvalidCredentials,AuthorizationError
-from web_api.services.JWTService import JWTService
-from web_api.services.AuthService import AuthPayload, AuthService
-from web_api.data_models.enums import AppRole
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from web_api.core.config import get_settings
+from web_api.data_models.enums import AppRole
+from web_api.db.models import User
+from web_api.db.session import get_session
+from web_api.errors import AccountNotActive, AuthorizationError, InvalidOrExpiredToken
+from web_api.services.AuthService import AuthService
+from web_api.services.JWTService import JWTService
 
 _oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/users/login")
+
+SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 
 def _get_jwt_service(request: Request) -> JWTService:
     return request.app.state.jwt_service
 
 
-def get_auth_service(request: Request) -> AuthService:
-    """Accessor: hand routers the single AuthService built in lifespan."""
-    return request.app.state.auth_service
+def get_auth_service(request: Request, session: SessionDep) -> AuthService:
+    """Per-request AuthService over the request's DB session and the app's stateless services."""
+    state = request.app.state
+    return AuthService(session, get_settings(), state.security_service, state.jwt_service, state.email_service)
 
 
-def _get_current_user(
+async def get_current_user(
+    session: SessionDep,
     token: str = Depends(_oauth2_scheme),
     jwt_service: JWTService = Depends(_get_jwt_service),
-) -> AuthPayload:
-    """Authentication only: verify the token, return the caller's identity."""
+) -> User:
+    """Verify the token, then load the user so deactivation takes effect immediately."""
+    payload = jwt_service.verify_token(token)
     try:
-        payload_dict = jwt_service.verify_token(token)
-        return AuthPayload(**payload_dict)
-    except Exception:
-        raise InvalidCredentials("Invalid authentication token") 
+        user_id = uuid.UUID(payload["sub"])
+    except (KeyError, ValueError):
+        raise InvalidOrExpiredToken()
+    user = await session.get(User, user_id)
+    if not user:
+        raise InvalidOrExpiredToken()
+    if not user.is_active:
+        raise AccountNotActive()
+    return user
 
 
 def _require_role(*allowed_roles: AppRole):
-    """Factory: build a dependency that allows only the given app role(s)."""
-
-    def dependency(
-        current_user: AuthPayload = Depends(_get_current_user),
-    ) -> AuthPayload:
-        if current_user.role not in allowed_roles:
+    async def dependency(user: User = Depends(get_current_user)) -> User:
+        if user.app_role not in allowed_roles:
             raise AuthorizationError("Access denied. Insufficient permissions.")
-        return current_user
+        return user
 
     return dependency
 
 
-
-AdminUser = Depends(_require_role(AppRole.ADMIN))
-RegularUser = Depends(_require_role(AppRole.USER))
-AnyUser = Depends(_get_current_user) 
+CurrentUser = Annotated[User, Depends(get_current_user)]
+AdminUser = Annotated[User, Depends(_require_role(AppRole.ADMIN))]
+AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]

@@ -1,122 +1,34 @@
-"""
-Webhook endpoints for workers to notify web_api of processing completion.
-"""
+"""Workers report per-document results here. Requires the X-Internal-Token header."""
+from fastapi import APIRouter
 
-from fastapi import APIRouter, HTTPException, Body
-from pydantic import BaseModel, Field
-from typing import List, Optional
-from datetime import datetime
-from beanie import PydanticObjectId
-from web_api.data_models.BasicBeanieModels import DocumentModel, ChunkModel
+from web_api.data_models.enums import DocumentStatus
+from web_api.data_models.ProcessingModels import ProcessingCompletionWebhook, ProcessingFailedWebhook, WebhookAck
+from web_api.deps.auth import SessionDep
+from web_api.deps.internal import InternalOnly
+from web_api.services.ProcessingService import ProcessingService
 
-router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
+router = APIRouter(prefix="/webhooks", tags=["Webhooks"], dependencies=[InternalOnly])
 
 
-class ChunkCompletionData(BaseModel):
-    """Data for a completed chunk"""
-    chunk_index: int
-    qdrant_point_id: str
-    metadata: Optional[dict] = None
+@router.post("/processing-complete", response_model=WebhookAck)
+async def processing_complete(payload: ProcessingCompletionWebhook, session: SessionDep):
+    """Document finished: store its chunk -> Qdrant point links and update statuses."""
+    succeeded = payload.status != "failed"
+    created = await ProcessingService(session).record_completion(
+        payload.task_id, payload.document_id, succeeded, payload.chunks_data, payload.error_message
+    )
+    return WebhookAck(
+        message="Processing completion recorded",
+        document_id=payload.document_id,
+        status=DocumentStatus.COMPLETED if succeeded else DocumentStatus.FAILED,
+        chunks_created=created,
+    )
 
 
-class ProcessingCompletionWebhook(BaseModel):
-    """Webhook payload when worker completes processing a document"""
-    task_id: str
-    document_id: str
-    project_id: str
-    status: str = Field(..., description="completed, failed, partial")
-    chunks_processed: int
-    total_chunks: int
-    chunks_data: List[ChunkCompletionData]
-    error_message: Optional[str] = None
-    completed_at: datetime = Field(default_factory=datetime.utcnow)
-
-
-@router.post("/processing-complete")
-async def processing_complete(payload: ProcessingCompletionWebhook = Body(...)):
-    """
-    Called by worker when document processing is complete.
-    Updates document status and creates chunk records in MongoDB.
-    
-    Args:
-        payload: Processing completion data
-        
-    Returns:
-        Confirmation message
-    """
-    try:
-        doc_obj_id = PydanticObjectId(payload.document_id)
-        project_obj_id = PydanticObjectId(payload.project_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid document or project ID format")
-    
-    # Verify document exists
-    document = await DocumentModel.get(doc_obj_id)
-    if not document:
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    # Create chunk records in MongoDB
-    chunk_records = []
-    for chunk_data in payload.chunks_data:
-        chunk = ChunkModel(
-            document_id=doc_obj_id,
-            project_id=project_obj_id,
-            chunk_index=chunk_data.chunk_index,
-            qdrant_point_id=chunk_data.qdrant_point_id,
-            processing_status="completed" if payload.status == "completed" else "failed",
-            completed_at=payload.completed_at,
-            error_message=payload.error_message,
-            metadata=chunk_data.metadata
-        )
-        chunk_records.append(chunk)
-    
-    # Bulk insert chunks
-    if chunk_records:
-        await ChunkModel.insert_many(chunk_records)
-    
-    return {
-        "message": "Processing completion recorded",
-        "document_id": payload.document_id,
-        "chunks_created": len(chunk_records),
-        "status": payload.status
-    }
-
-
-@router.post("/processing-failed")
-async def processing_failed(
-    task_id: str = Body(...),
-    document_id: str = Body(...),
-    error_message: str = Body(...),
-    stage: str = Body(..., description="Stage where processing failed")
-):
-    """
-    Called by worker when document processing fails completely.
-    
-    Args:
-        task_id: Celery task ID
-        document_id: Document ID
-        error_message: Error description
-        stage: Processing stage that failed
-        
-    Returns:
-        Confirmation message
-    """
-    try:
-        doc_obj_id = PydanticObjectId(document_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid document ID format")
-    
-    # Verify document exists
-    document = await DocumentModel.get(doc_obj_id)
-    if not document:
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    # Log the failure (you can expand this to update document status, etc.)
-    # For now, just acknowledge
-    
-    return {
-        "message": "Processing failure recorded",
-        "document_id": document_id,
-        "task_id": task_id,
-        "stage": stage
-    }
+@router.post("/processing-failed", response_model=WebhookAck)
+async def processing_failed(payload: ProcessingFailedWebhook, session: SessionDep):
+    await ProcessingService(session).record_failure(
+        payload.task_id, payload.document_id, payload.error_message, payload.stage
+    )
+    return WebhookAck(message="Processing failure recorded", document_id=payload.document_id,
+                      status=DocumentStatus.FAILED)

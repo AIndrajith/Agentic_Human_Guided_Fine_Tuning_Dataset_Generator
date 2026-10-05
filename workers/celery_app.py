@@ -3,7 +3,9 @@ Celery application configuration.
 """
 
 from celery import Celery
+from celery.signals import worker_ready
 from workers.config import Config
+from workers.utils.temp_file_manager import TempFileManager
 
 # Create Celery app
 celery_app = Celery(
@@ -29,6 +31,12 @@ celery_app.conf.update(
     task_time_limit=3600 * 6,  # 6 hours max per task
     task_soft_time_limit=3600 * 5,  # Soft limit: 5 hours
 )
+
+
+@worker_ready.connect
+def _sweep_temp_files(**_):
+    """Delete temp folders left by earlier failed runs (older than TEMP_FILE_RETENTION_HOURS)."""
+    TempFileManager().cleanup_old_directories()
 
 if __name__ == "__main__":
     celery_app.start()

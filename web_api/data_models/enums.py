@@ -1,14 +1,14 @@
 from enum import Enum
 
 
-class FileType(Enum):
+class FileType(str, Enum):
     PDF    = "pdf"
     IMAGES = "images"
 
 
-class Datatype(Enum):
+class Datatype(str, Enum):
     FICTION  = "fiction"
-    ACADAMIC = "acdamic"
+    ACADEMIC = "academic"
 
 
 class AppRole(str, Enum):
@@ -19,6 +19,26 @@ class AppRole(str, Enum):
 class ProjectRole(str, Enum):
     OWNER  = "owner"
     WORKER = "worker"
+
+
+class DocumentStatus(str, Enum):
+    UPLOADED   = "uploaded"
+    QUEUED     = "queued"
+    PROCESSING = "processing"
+    COMPLETED  = "completed"
+    FAILED     = "failed"
+
+
+class JobStatus(str, Enum):
+    QUEUED    = "queued"
+    RUNNING   = "running"
+    COMPLETED = "completed"
+    PARTIAL   = "partial"
+    FAILED    = "failed"
+
+
+class EmailKind(str, Enum):
+    INVITE = "invite"
 
 
 class ModelProvider(str, Enum):
@@ -45,3 +65,18 @@ class ModelStage(str, Enum):
     META_AGENT         = "meta_agent"
     EMBEDDER           = "embedder"
     RERANKER           = "reranker"
+    VISION             = "vision"      # image captioning + Marker LLM
+
+
+class ModelCapability(str, Enum):
+    """What a model can do. Each stage needs exactly one (see providers.STAGE_CAPABILITY)."""
+    CHAT      = "chat"
+    EMBEDDING = "embedding"
+    RERANK    = "rerank"
+    VISION    = "vision"
+
+
+class RegisteredModelStatus(str, Enum):
+    UNTESTED = "untested"
+    OK       = "ok"
+    FAILED   = "failed"
